@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="J.A.R.V.I.S — Just A Rather Very Intelligent System. Iron Man inspired cognitive AI HUD.">
+  <title>J.A.R.V.I.S — Cognitive AI</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>🤖</text></svg>">
+  <!-- Syntax highlighting for code blocks (free CDN) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body data-state="dormant">
+
+  <!-- Scanline overlay -->
+  <div class="scanlines"></div>
+
+  <!-- Floating particles -->
+  <div class="particles" id="particles"></div>
+
+  <!-- ═══ TOP BAR ═══ -->
+  <div class="top-bar">
+    <div class="top-bar__logo">J.A.R.V.I.S</div>
+    <div class="top-bar__center">
+      <!-- Model badge -->
+      <div class="model-badge" id="model-badge">
+        <span class="model-badge__tier" id="badge-tier">AUTO</span>
+        <span class="model-badge__name" id="badge-model">—</span>
+      </div>
+    </div>
+    <div class="top-bar__status">
+      <div class="memory-indicator hidden" id="memory-indicator" title="Memory active">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z"/><path d="M12 6v6l4 2"/>
+        </svg>
+      </div>
+      <div class="status-dot" id="status-dot"></div>
+      <span id="status-text">INITIALIZING</span>
+    </div>
+  </div>
+
+  <!-- ═══ MODE SELECTOR ═══ -->
+  <div class="mode-selector" id="mode-selector">
+    <button class="mode-btn" data-mode="fast" id="mode-fast" title="Fast — reflex model">
+      <span class="mode-icon">⚡</span>
+      <span class="mode-label">FAST</span>
+    </button>
+    <button class="mode-btn active" data-mode="auto" id="mode-auto" title="Auto — smart routing">
+      <span class="mode-icon">🧠</span>
+      <span class="mode-label">AUTO</span>
+    </button>
+    <button class="mode-btn" data-mode="smart" id="mode-smart" title="Smart — analyst model">
+      <span class="mode-icon">💎</span>
+      <span class="mode-label">SMART</span>
+    </button>
+  </div>
+
+  <!-- ═══ HUD CENTER ═══ -->
+  <div class="hud-container" id="hud-container">
+    <div class="corner-bracket tl"></div>
+    <div class="corner-bracket tr"></div>
+    <div class="corner-bracket bl"></div>
+    <div class="corner-bracket br"></div>
+
+    <!-- Audio waveform canvas (for LISTENING state) -->
+    <canvas class="waveform-canvas" id="waveform-canvas"></canvas>
+
+    <!-- Rotating rings -->
+    <div class="ring ring-4"></div>
+    <div class="ring ring-3"></div>
+    <div class="ring ring-2"></div>
+    <div class="ring-ticks" id="ring-ticks"></div>
+    <div class="ring ring-1"></div>
+
+    <!-- Core -->
+    <div class="hud-core" id="hud-core">
+      <span class="core-label" id="core-label">JARVIS</span>
+    </div>
+  </div>
+
+  <!-- ═══ ACTION PANEL (slides in from right during ACTING state) ═══ -->
+  <div class="action-panel hidden" id="action-panel">
+    <div class="action-panel__header">
+      <span class="action-panel__title">EXECUTING</span>
+      <div class="action-panel__progress">
+        <div class="action-panel__progress-bar" id="action-progress-bar"></div>
+      </div>
+    </div>
+    <div class="action-panel__steps" id="action-steps"></div>
+  </div>
+
+  <!-- ═══ RESPONSE AREA ═══ -->
+  <div class="response-container" id="response-container">
+    <div class="response-header">
+      <div class="response-label">OUTPUT</div>
+      <div class="response-badges">
+        <div class="fallback-badge hidden" id="fallback-badge">⚠ FALLBACK</div>
+        <div class="memory-badge hidden" id="memory-badge">🧠 MEMORY</div>
+      </div>
+    </div>
+    <div class="response-text" id="response-text">
+      Systems online. Awaiting your command, sir.
+    </div>
+  </div>
+
+  <!-- ═══ INPUT AREA ═══ -->
+  <div class="input-container">
+    <!-- Voice toggle button -->
+    <button class="voice-btn" id="voice-btn" title="Toggle voice input">
+      <svg class="voice-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+        <line x1="12" y1="19" x2="12" y2="23"/>
+        <line x1="8" y1="23" x2="16" y2="23"/>
+      </svg>
+      <div class="voice-ring" id="voice-ring"></div>
+    </button>
+    <span class="input-prefix">CMD ›</span>
+    <input type="text" id="user-input" placeholder="Ask JARVIS anything..." autocomplete="off" spellcheck="false">
+    <button class="send-btn" id="send-btn">SEND</button>
+  </div>
+
+  <!-- ═══ CONVERSATION LOG (toggleable panel) ═══ -->
+  <div class="conv-log hidden" id="conv-log">
+    <div class="conv-log__header">
+      <span>CONVERSATION LOG</span>
+      <button class="conv-log__close" id="conv-log-close">✕</button>
+    </div>
+    <div class="conv-log__body" id="conv-log-body"></div>
+  </div>
+
+  <!-- ═══ BOTTOM BAR ═══ -->
+  <div class="bottom-bar">
+    <span class="sys-stat" id="sys-cpu">CPU: —%</span>
+    <span class="sys-stat" id="sys-ram">RAM: —%</span>
+    <span class="sys-stat" id="sys-battery">BAT: —</span>
+    <span class="bottom-sep">│</span>
+    <span id="model-label">MODE: AUTO</span>
+    <span id="engine-label">ENGINE: OLLAMA</span>
+    <span class="bottom-sep">│</span>
+    <button class="bottom-btn" id="toggle-log-btn" title="Toggle conversation log">LOG</button>
+    <button class="bottom-btn" id="toggle-stats-btn" title="Session stats">STATS</button>
+    <button class="bottom-btn" id="wake-toggle-btn" title="Toggle wake word (Hey JARVIS)">WAKE: OFF</button>
+    <button class="bottom-btn" id="tts-toggle-btn" title="Toggle voice output (JARVIS speaks responses)">TTS: OFF</button>
+  </div>
+
+  <!-- ═══ TOAST NOTIFICATION ═══ -->
+  <div class="toast" id="toast"></div>
+
+  <script src="script.js"></script>
+</body>
+</html>

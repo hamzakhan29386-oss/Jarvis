@@ -268,7 +268,7 @@ def train_model(model_name: str = "hey_jarvis_custom", epochs: int = 150):
         return False
 
     try:
-        from openwakeword.custom import train_custom_model
+        from openwakeword import train_custom_verifier as train_custom_model
         train_custom_model(
             positive_reference_clips=[str(pos_dir)],
             negative_reference_clips=[str(neg_dir)],

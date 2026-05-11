@@ -106,6 +106,7 @@ class WakeWordEngine:
 
         try:
             predictions = self._model.predict(chunk_np)
+            print(predictions)
         except Exception as e:
             log.debug(f"[Detector] predict error: {e}")
             return False, "", 0.0

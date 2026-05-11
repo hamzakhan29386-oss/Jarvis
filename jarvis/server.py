@@ -35,7 +35,8 @@ from brain import (
     think, think_stream, check_nvidia, check_openrouter, check_gemini,
     set_mode, get_mode, get_session_stats, CURRENT_MODE,
 )
-
+# ── Production wake word system ──────────────────────────────────────────────
+from wake.service import get_wake_service as _get_production_wake_service
 app = Flask(__name__, static_folder=".", static_url_path="")
 
 # ── CORS support ────────────────────────────────────────────────────────────
@@ -399,21 +400,11 @@ def session_stats():
 
 @app.route("/voice/wake-stream")
 def voice_wake_stream():
-    """
-    SSE stream for wake word events.
-    Frontend connects once; events are pushed as they happen:
-        data: {"event": "detected"}
-        data: {"event": "listening"}
-        data: {"event": "transcript", "text": "..."}
-        data: {"event": "error", "message": "..."}
-        data: {"event": "heartbeat"}
-    """
+    """SSE stream — production wake word events."""
     def generate():
         try:
-            from voice import get_wake_service
-            svc = get_wake_service()
+            svc = _get_production_wake_service()
             if not svc.is_enabled():
-                # Service is off — send a status event then close
                 yield f"data: {json.dumps({'event': 'disabled'})}\n\n"
                 return
             for event in svc.subscribe():
@@ -436,12 +427,11 @@ def voice_wake_stream():
 
 @app.route("/voice/wake-enable", methods=["POST"])
 def voice_wake_enable():
-    """Enable wake word detection."""
+    """Enable wake word detection (production service)."""
     try:
-        from voice import get_wake_service
-        svc = get_wake_service()
+        svc = _get_production_wake_service()
         svc.enable()
-        return jsonify({"success": True, "wake_word": True})
+        return jsonify({"success": True, "wake_word": True, "status": svc.get_status()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -450,8 +440,7 @@ def voice_wake_enable():
 def voice_wake_disable():
     """Disable wake word detection."""
     try:
-        from voice import get_wake_service
-        svc = get_wake_service()
+        svc = _get_production_wake_service()
         svc.disable()
         return jsonify({"success": True, "wake_word": False})
     except Exception as e:
@@ -462,12 +451,10 @@ def voice_wake_disable():
 def voice_wake_status():
     """Return wake word service status."""
     try:
-        from voice import get_wake_service
-        svc = get_wake_service()
-        return jsonify({"enabled": svc.is_enabled()})
+        svc = _get_production_wake_service()
+        return jsonify({"enabled": svc.is_enabled(), **svc.get_status()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STARTUP

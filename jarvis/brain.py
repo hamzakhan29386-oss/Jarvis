@@ -1,21 +1,19 @@
 """
-brain.py — JARVIS Cognitive Architecture (Cloud API Edition)
-==============================================================
-AI Control Layer with intelligent query classification and model routing.
-All models are 100% free — NVIDIA NIM + OpenRouter free tier.
-No local GPU or Ollama required.
+brain.py — JARVIS Cognitive Architecture (Hybrid Local + Cloud)
+================================================================
+HYBRID ARCHITECTURE:
+  - reflex  → Ollama local (llama3.2:3b) — instant, no latency
+  - analyst → NVIDIA NIM cloud
+  - coder   → OpenRouter cloud
+  - oracle  → NVIDIA NIM cloud
+  - ultra   → NVIDIA NIM cloud
+  - backup  → OpenRouter cloud fallback
 
-Models (6-tier cloud architecture):
-    reflex      — deepseek-v3 (NVIDIA NIM, instant)
-    analyst     — deepseek-v3 (NVIDIA NIM, reasoning)
-    coder       — qwen3-coder-480b (OpenRouter :free, code)
-    oracle      — deepseek-r1 (OpenRouter :free, deep reasoning)
-    ultra       — llama-3.1-70b (NVIDIA NIM, large context)
-    backup      — llama-3.2-3b-instruct (OpenRouter :free, always available)
+Ollama powers fast conversational interactions locally.
+Cloud models handle intelligence-heavy tasks.
 
 Usage:
     from brain import think, think_stream, set_mode, get_mode
-    result = think("Hello JARVIS")
 """
 
 import os
@@ -28,10 +26,8 @@ import threading
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# ── Load environment variables ──────────────────────────────────────────────
 load_dotenv()
 
-# ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
 log = logging.getLogger("jarvis.brain")
 
@@ -39,21 +35,25 @@ log = logging.getLogger("jarvis.brain")
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
-OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
+NVIDIA_API_KEY   = os.getenv("NVIDIA_API_KEY", "")
+OPENROUTER_KEY   = os.getenv("OPENROUTER_API_KEY", "")
 
 NVIDIA_BASE_URL     = "https://integrate.api.nvidia.com/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OLLAMA_BASE_URL     = "http://localhost:11434/v1"   # ← local Ollama
 
 MODELS = {
 
-   "reflex": {
-    "provider":    "nvidia",
-    "model":       "meta/llama-3.2-3b-instruct",  # reliable, fast on NVIDIA
-    "max_tokens":  256,
-    "temperature": 0.7,
-},
+    # ── LOCAL (Ollama) — zero cloud latency ─────────────────────────────
+    "reflex": {
+        "provider":    "ollama",
+        "model":       "llama3.2:3b",
+        "use_for":     "greetings, commands, quick answers, voice replies",
+        "max_tokens":  256,
+        "temperature": 0.7,
+    },
 
+    # ── CLOUD — intelligence tasks ───────────────────────────────────────
     "analyst": {
         "provider":    "nvidia",
         "model":       "deepseek-ai/deepseek-v4-flash",
@@ -61,7 +61,6 @@ MODELS = {
         "max_tokens":  2048,
         "temperature": 0.6,
     },
-
     "coder": {
         "provider":    "openrouter",
         "model":       "qwen/qwen3-coder-480b:free",
@@ -69,7 +68,6 @@ MODELS = {
         "max_tokens":  4096,
         "temperature": 0.3,
     },
-
     "oracle": {
         "provider":    "nvidia",
         "model":       "deepseek-ai/deepseek-r1",
@@ -77,7 +75,6 @@ MODELS = {
         "max_tokens":  4096,
         "temperature": 0.4,
     },
-
     "ultra": {
         "provider":    "nvidia",
         "model":       "meta/llama-3.1-70b-instruct",
@@ -85,49 +82,37 @@ MODELS = {
         "max_tokens":  8192,
         "temperature": 0.5,
     },
-
     "backup": {
         "provider":    "openrouter",
         "model":       "meta-llama/llama-3.2-3b-instruct:free",
-        "use_for":     "fallback when all else fails",
+        "use_for":     "cloud fallback when all else fails",
         "max_tokens":  1024,
         "temperature": 0.7,
     },
-    # ADD these two new entries to MODELS:
     "backup2": {
-    "provider":    "openrouter",
-    "model":       "google/gemma-3-4b-it:free",
-    "use_for":     "second fallback",
-    "max_tokens":  512,
-    "temperature": 0.7,
-},
+        "provider":    "openrouter",
+        "model":       "google/gemma-3-4b-it:free",
+        "use_for":     "second cloud fallback",
+        "max_tokens":  512,
+        "temperature": 0.7,
+    },
     "backup3": {
-    "provider":    "openrouter",
-    "model":       "mistralai/mistral-small-3.1:free",
-    "use_for":     "third fallback",
-    "max_tokens":  512,
-    "temperature": 0.7,
-},
+        "provider":    "openrouter",
+        "model":       "mistralai/mistral-small-3.1:free",
+        "use_for":     "third cloud fallback",
+        "max_tokens":  512,
+        "temperature": 0.7,
+    },
 }
-# THEN update ALL fallback chains to include backup2 + backup3:
+
+# Reflex falls back to cloud backup if Ollama is offline
 FALLBACK_CHAINS = {
-    "reflex":  ["reflex",  "analyst", "backup", "backup2", "backup3"],
-    "analyst": ["analyst", "reflex",  "backup", "backup2", "backup3"],
-    "coder":   ["coder",   "oracle",  "analyst", "backup", "backup2", "backup3"],
-    "oracle":  ["oracle",  "analyst", "backup", "backup2", "backup3"],
-    "ultra":   ["ultra",   "oracle",  "analyst", "backup", "backup2", "backup3"],
+    "reflex":  ["reflex",  "backup",  "backup2", "backup3"],
+    "analyst": ["analyst", "reflex",  "backup",  "backup2", "backup3"],
+    "coder":   ["coder",   "oracle",  "analyst", "backup",  "backup2", "backup3"],
+    "oracle":  ["oracle",  "analyst", "backup",  "backup2", "backup3"],
+    "ultra":   ["ultra",   "oracle",  "analyst", "backup",  "backup2", "backup3"],
     "backup":  ["backup",  "backup2", "backup3"],
-}
-
-
-
-FALLBACK_CHAINS = {
-    "reflex":  ["reflex",  "analyst", "backup"],
-    "analyst": ["analyst", "reflex",  "backup"],
-    "coder":   ["coder",   "oracle",  "analyst", "backup"],
-    "oracle":  ["oracle",  "analyst", "backup"],
-    "ultra":   ["ultra",   "oracle",  "analyst", "backup"],
-    "backup":  ["backup"],
 }
 
 CURRENT_MODE = "auto"
@@ -138,6 +123,7 @@ _gen_lock = threading.Lock()
 _session_stats = {
     "reflex": 0, "analyst": 0, "coder": 0, "oracle": 0,
     "ultra": 0, "backup": 0, "total": 0, "fallbacks": 0,
+    "local_calls": 0, "cloud_calls": 0,
 }
 _stats_lock = threading.Lock()
 
@@ -155,7 +141,7 @@ def _get_memory():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  QUERY CLASSIFICATION
+#  QUERY CLASSIFICATION (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _REFLEX_KEYWORDS = [
@@ -194,110 +180,116 @@ _ANALYST_KEYWORDS = [
 
 
 def classify_query(query: str) -> str:
-    """Zero-cost keyword classifier. No API call needed."""
+    """Zero-cost keyword classifier."""
     q = query.lower().strip()
 
     if len(q) < 20 or any(kw in q for kw in _REFLEX_KEYWORDS):
         if not any(kw in q for kw in _CODER_KEYWORDS + _ANALYST_KEYWORDS + _ORACLE_KEYWORDS):
-            log.info("[JARVIS CORE] → Classified: reflex | Reason: keyword_match")
+            log.info("[JARVIS CORE] → Classified: reflex (local)")
             return "reflex"
 
     for p in _ULTRA_KEYWORDS:
         if p in q:
-            log.info("[JARVIS CORE] → Classified: ultra | Reason: ultra_keyword")
+            log.info("[JARVIS CORE] → Classified: ultra (cloud)")
             return "ultra"
 
     if any(kw in q for kw in _CODER_KEYWORDS):
-        log.info("[JARVIS CORE] → Classified: coder | Reason: code_keyword")
+        log.info("[JARVIS CORE] → Classified: coder (cloud)")
         return "coder"
 
     for p in _ORACLE_KEYWORDS:
         if p in q:
-            log.info("[JARVIS CORE] → Classified: oracle | Reason: oracle_keyword")
+            log.info("[JARVIS CORE] → Classified: oracle (cloud)")
             return "oracle"
 
     if any(kw in q for kw in _ANALYST_KEYWORDS) or len(query) > 100:
-        log.info("[JARVIS CORE] → Classified: analyst | Reason: analysis_keyword")
+        log.info("[JARVIS CORE] → Classified: analyst (cloud)")
         return "analyst"
 
-    log.info("[JARVIS CORE] → Classified: analyst | Reason: default")
+    log.info("[JARVIS CORE] → Classified: analyst (cloud, default)")
     return "analyst"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  UNIFIED MODEL CALLER
+#  MODEL CLIENT FACTORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _make_client(provider: str) -> OpenAI | None:
-    """
-    Build an OpenAI-compatible client for the given provider.
-    max_retries=0 prevents the SDK from hanging on 429 errors.
-    timeout=15.0 ensures requests never freeze forever.
-    Returns None if the required API key is missing.
-    """
-    if provider == "nvidia":
+    """Build an OpenAI-compatible client for the given provider."""
+
+    if provider == "ollama":
+        # Local Ollama — always available, no key required
+        return OpenAI(
+            api_key="ollama",          # Ollama ignores the key
+            base_url=OLLAMA_BASE_URL,
+            max_retries=0,
+            timeout=8.0,               # Local is fast; 8s is generous
+        )
+
+    elif provider == "nvidia":
         if not NVIDIA_API_KEY:
-            log.warning("[JARVIS] NVIDIA key missing")
+            log.warning("[JARVIS] NVIDIA key missing — will cascade")
             return None
         return OpenAI(
             api_key=NVIDIA_API_KEY,
             base_url=NVIDIA_BASE_URL,
-            max_retries=0,   # ← CRITICAL: stop SDK auto-retry on 429
-            timeout=15.0,    # ← CRITICAL: hard timeout, never freeze forever
+            max_retries=0,
+            timeout=15.0,
         )
+
     else:  # openrouter
         if not OPENROUTER_KEY:
-            log.warning("[JARVIS] OpenRouter key missing")
+            log.warning("[JARVIS] OpenRouter key missing — will cascade")
             return None
         return OpenAI(
             api_key=OPENROUTER_KEY,
             base_url=OPENROUTER_BASE_URL,
-            max_retries=0,   # ← CRITICAL: stop SDK auto-retry on 429
-            timeout=20.0,    # OpenRouter is slightly slower than NVIDIA
+            max_retries=0,
+            timeout=20.0,
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MODEL CALLERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _call_model_non_stream(tier: str, messages: list) -> str | None:
-    """
-    Non-streaming model caller.
-    Returns full response text or None on failure.
-    """
     cfg = MODELS.get(tier, MODELS["backup"])
     client = _make_client(cfg["provider"])
 
     if client is None:
-        # Key missing — try backup directly
         if tier != "backup":
             return _call_model_non_stream("backup", messages)
-        return "API keys not configured, sir. Please set NVIDIA_API_KEY or OPENROUTER_API_KEY in .env"
+        return "API keys not configured, sir."
 
-    log.info(f"[JARVIS CORE] → Tier: {tier} | Model: {cfg['model']} | Provider: {cfg['provider']}")
+    log.info(
+        f"[JARVIS CORE] → Tier: {tier} | Model: {cfg['model']} "
+        f"| Provider: {cfg['provider']} ({'LOCAL' if cfg['provider']=='ollama' else 'CLOUD'})"
+    )
 
     try:
         response = client.chat.completions.create(
-            model       = cfg["model"],
-            messages    = messages,
-            max_tokens  = cfg["max_tokens"],
-            temperature = cfg.get("temperature", 0.7),
-            stream      = False,
+            model=cfg["model"],
+            messages=messages,
+            max_tokens=cfg["max_tokens"],
+            temperature=cfg.get("temperature", 0.7),
+            stream=False,
         )
         return response.choices[0].message.content
 
     except Exception as e:
-        # ── FIX: err is now correctly inside the except block ──────────
         err = str(e)
         if "429" in err or "Too Many Requests" in err:
             log.warning(f"[JARVIS] {tier} rate limited — cascading immediately")
+        elif "Connection refused" in err or "ConnectError" in err:
+            log.warning(f"[JARVIS] {tier} unreachable (Ollama running?) — cascading")
         else:
             log.error(f"[JARVIS] {tier} failed: {err}")
         return None
 
 
 def _call_model_stream(tier: str, messages: list):
-    """
-    Streaming model caller. Yields token strings as they arrive.
-    Falls back to backup tier on failure or rate limit.
-    """
+    """Streaming model caller. Yields token strings."""
     cfg = MODELS.get(tier, MODELS["backup"])
     client = _make_client(cfg["provider"])
 
@@ -305,39 +297,40 @@ def _call_model_stream(tier: str, messages: list):
         if tier != "backup":
             yield from _call_model_stream("backup", messages)
         else:
-            yield "API keys not configured, sir. Please set NVIDIA_API_KEY or OPENROUTER_API_KEY in .env"
+            yield "API keys not configured, sir."
         return
 
     log.info(
-        f"[JARVIS CORE] → Tier: {tier} | Model: {cfg['model']} "
-        f"| Provider: {cfg['provider']} | Stream: True"
+        f"[JARVIS CORE] → Streaming: {tier} | {cfg['model']} "
+        f"| {'LOCAL' if cfg['provider']=='ollama' else 'CLOUD'}"
     )
 
     try:
         response = client.chat.completions.create(
-            model       = cfg["model"],
-            messages    = messages,
-            max_tokens  = cfg["max_tokens"],
-            temperature = cfg.get("temperature", 0.7),
-            stream      = True,
+            model=cfg["model"],
+            messages=messages,
+            max_tokens=cfg["max_tokens"],
+            temperature=cfg.get("temperature", 0.7),
+            stream=True,
         )
         for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
 
     except Exception as e:
-        # ── FIX: err is now correctly inside the except block ──────────
         err = str(e)
         if "429" in err or "Too Many Requests" in err:
-            log.warning(f"[JARVIS] {tier} rate limited — cascading immediately (no retry wait)")
+            log.warning(f"[JARVIS] {tier} rate limited — cascading")
+        elif "Connection refused" in err or "ConnectError" in err:
+            log.warning(f"[JARVIS] {tier} (Ollama) unreachable — cascading to cloud")
         else:
             log.error(f"[JARVIS] {tier} stream failed: {err}")
 
         if tier != "backup":
-            log.info(f"[JARVIS] Cascading to backup tier...")
+            log.info(f"[JARVIS] Cascading from {tier} to next in chain...")
             yield from _call_model_stream("backup", messages)
         else:
-            yield "All providers are currently unavailable, sir. Try again in a moment."
+            yield "All providers currently unavailable, sir."
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -359,15 +352,17 @@ def get_mode() -> dict:
         "mode": CURRENT_MODE,
         "models": {k: v["model"] for k, v in MODELS.items()},
         "active_model": _resolve_model_name(),
+        "local_model": MODELS["reflex"]["model"],
+        "ollama_url": OLLAMA_BASE_URL,
     }
 
 
 def _resolve_model_name() -> str:
     if CURRENT_MODE == "fast":
-        return MODELS["reflex"]["model"]
+        return MODELS["reflex"]["model"] + " (local)"
     elif CURRENT_MODE == "smart":
         return MODELS["oracle"]["model"]
-    return "auto"
+    return "auto (local+cloud)"
 
 
 def get_session_stats() -> dict:
@@ -382,22 +377,19 @@ def _record_stat(tier: str, is_fallback: bool = False):
             _session_stats[tier] += 1
         if is_fallback:
             _session_stats["fallbacks"] += 1
+        provider = MODELS.get(tier, {}).get("provider", "")
+        if provider == "ollama":
+            _session_stats["local_calls"] += 1
+        else:
+            _session_stats["cloud_calls"] += 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN ENTRY POINT
+#  MAIN THINK (non-streaming)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def think(prompt: str) -> dict:
-    """
-    Full JARVIS cognitive pipeline (non-streaming).
-    1. Memory retrieval
-    2. System prompt assembly
-    3. Query classification
-    4. Model routing with fallback chain
-    5. Response generation
-    6. Memory update
-    """
+    """Full JARVIS cognitive pipeline (non-streaming)."""
     mem = _get_memory()
     memory_used = False
     retrieved_episodes = []
@@ -435,8 +427,7 @@ def think(prompt: str) -> dict:
             response = (
                 f"Understood, sir. I've memorized the procedure "
                 f"'{remember_cmd['name']}' with {len(remember_cmd['steps'])} steps: "
-                f"{', '.join(remember_cmd['steps'])}. "
-                f"Just say '{remember_cmd['name'].replace('_', ' ')}' and I'll execute it."
+                f"{', '.join(remember_cmd['steps'])}."
             )
             mem.remember(prompt, response, tags=["procedure", "memory"])
             return {
@@ -475,11 +466,6 @@ def think(prompt: str) -> dict:
             fallback_used = True
             log.warning(f"[JARVIS CORE] Fallback → {model_key}")
 
-        log.info(
-            f"[JARVIS CORE] → Routing to: {model_key} "
-            f"| Model: {model_info['model']} | Provider: {model_info['provider']} | Free: True"
-        )
-
         response = _call_model_non_stream(model_key, messages)
         if response:
             used_model = model_info["model"]
@@ -490,7 +476,7 @@ def think(prompt: str) -> dict:
     if not response:
         response = (
             "All AI engines are currently offline, sir. "
-            "Please check NVIDIA_API_KEY and OPENROUTER_API_KEY in your .env file."
+            "Ensure Ollama is running and API keys are set in .env."
         )
         used_model = "none"
         fallback_used = True
@@ -503,9 +489,10 @@ def think(prompt: str) -> dict:
             log.warning(f"[Brain] Memory update failed: {e}")
 
     t_elapsed = time.time() - t_start
+    provider = MODELS.get(used_tier, {}).get("provider", "unknown")
     log.info(
         f"[PERF] think() | Model: {used_model} | Tier: {used_tier} "
-        f"| Time: {t_elapsed:.2f}s | Fallback: {fallback_used} | Memory: {memory_used}"
+        f"| Provider: {provider} | Time: {t_elapsed:.2f}s | Fallback: {fallback_used}"
     )
 
     return {
@@ -514,18 +501,19 @@ def think(prompt: str) -> dict:
         "model": used_model,
         "fallback": fallback_used,
         "tier": used_tier,
+        "provider": provider,
         "memory_used": memory_used,
         "response_time_ms": int(t_elapsed * 1000),
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STREAMING ENTRY POINT
+#  STREAMING THINK
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def think_stream(prompt: str):
     """
-    Generator — yields tokens as they arrive for SSE streaming in server.py.
+    Generator — yields tokens as they arrive for SSE streaming.
     Yields {"token": str} per token, {"done": True, ...} at end.
     """
     mem = _get_memory()
@@ -590,11 +578,6 @@ def think_stream(prompt: str):
         if i > 0:
             fallback_used = True
 
-        log.info(
-            f"[JARVIS CORE] → Streaming from: {model_key} "
-            f"| {model_info['model']} | {model_info['provider']}"
-        )
-
         try:
             streamed = False
 
@@ -607,8 +590,9 @@ def think_stream(prompt: str):
                     if first_token_time is None:
                         first_token_time = time.time()
                         log.info(
-                            f"[PERF] First token latency: "
-                            f"{(first_token_time - t_start)*1000:.0f}ms"
+                            f"[PERF] First token: "
+                            f"{(first_token_time - t_start)*1000:.0f}ms "
+                            f"({'LOCAL' if model_info['provider']=='ollama' else 'CLOUD'})"
                         )
                     full_response += token
                     yield {"token": token}
@@ -619,9 +603,10 @@ def think_stream(prompt: str):
 
             if streamed:
                 t_elapsed = time.time() - t_start
+                provider = model_info["provider"]
                 log.info(
-                    f"[PERF] stream() | Model: {model_info['model']} "
-                    f"| Time: {t_elapsed:.2f}s | Chars: {len(full_response)}"
+                    f"[PERF] stream() | {model_info['model']} "
+                    f"| {provider.upper()} | {t_elapsed:.2f}s | {len(full_response)} chars"
                 )
                 _record_stat(model_key, fallback_used)
                 if mem:
@@ -634,6 +619,7 @@ def think_stream(prompt: str):
                     "done": True,
                     "model": model_info["model"],
                     "tier": model_key,
+                    "provider": provider,
                     "fallback": fallback_used,
                     "memory_used": memory_used,
                     "response_time_ms": int(t_elapsed * 1000),
@@ -641,39 +627,57 @@ def think_stream(prompt: str):
                 return
 
         except Exception as e:
-            # ── FIX: err is now correctly inside the except block ──────
             err = str(e)
             if "429" in err or "Too Many Requests" in err:
-                log.warning(
-                    f"[JARVIS] {model_key} rate limited — "
-                    f"trying next in chain (no retry wait)"
-                )
+                log.warning(f"[JARVIS] {model_key} rate limited — trying next")
+            elif "Connection refused" in err or "ConnectError" in err:
+                log.warning(f"[JARVIS] {model_key} unreachable — trying next")
             else:
                 log.error(f"[JARVIS] {model_key} stream exception: {err}")
-            # Continue to next model in chain — don't stop here
             continue
 
-    # ── All models in chain exhausted ───────────────────────────────────
-    error_msg = "All engines offline, sir. Check your API keys in the .env file."
+    error_msg = "All engines offline, sir. Check Ollama and API keys."
     for ch in error_msg:
         yield {"token": ch}
     yield {"done": True, "model": "none", "tier": "none",
-           "fallback": True, "memory_used": False}
+           "provider": "none", "fallback": True, "memory_used": False}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HEALTH CHECKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def check_ollama() -> bool:
+    """Check if local Ollama is running and llama3.2:3b is available."""
+    try:
+        import requests
+        r = requests.get(
+            f"{OLLAMA_BASE_URL.replace('/v1', '')}/api/tags",
+            timeout=2.0
+        )
+        if r.status_code == 200:
+            models = [m.get("name", "") for m in r.json().get("models", [])]
+            available = any("llama3.2:3b" in m or "llama3.2" in m for m in models)
+            if not available:
+                log.info("[Ollama] Running but llama3.2:3b not pulled. Run: ollama pull llama3.2:3b")
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def check_ollama_local() -> bool:
+    """Alias for backward compat."""
+    return check_ollama()
+
+
 def check_nvidia() -> bool:
     return bool(NVIDIA_API_KEY)
+
 
 def check_openrouter() -> bool:
     return bool(OPENROUTER_KEY)
 
-def check_ollama() -> bool:
-    """Backward-compatible — checks if any cloud API key is configured."""
-    return check_nvidia() or check_openrouter()
 
 def check_gemini() -> bool:
     return bool(os.environ.get("GEMINI_API_KEY", "").strip())
@@ -698,15 +702,12 @@ def openrouter_think(prompt: str, model: str) -> str | None:
 
 
 def ollama_think(prompt: str) -> str | None:
+    """Now actually calls local Ollama reflex tier."""
     from memory import JARVIS_PERSONA
     messages = [{"role": "system", "content": JARVIS_PERSONA},
                 {"role": "user",   "content": prompt}]
-    return _call_model_non_stream("backup", messages)
+    return _call_model_non_stream("reflex", messages)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TERMINAL STREAMING (used by main.py)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def stream_response(user_input: str) -> str:
     """Stream AI response to terminal (backward compat for main.py)."""

@@ -40,81 +40,91 @@ OPENROUTER_KEY   = os.getenv("OPENROUTER_API_KEY", "")
 
 NVIDIA_BASE_URL     = "https://integrate.api.nvidia.com/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OLLAMA_BASE_URL     = "http://localhost:11434/v1"   # ← local Ollama
+OLLAMA_BASE_URL     = "http://localhost:11434/v1"
 
 MODELS = {
 
-    # ── LOCAL (Ollama) — zero cloud latency ─────────────────────────────
     "reflex": {
-        "provider":    "ollama",
-        "model":       "llama3.2:3b",
-        "use_for":     "greetings, commands, quick answers, voice replies",
-        "max_tokens":  256,
-        "temperature": 0.7,
-    },
-
-    # ── CLOUD — intelligence tasks ───────────────────────────────────────
-    "analyst": {
-        "provider":    "nvidia",
-        "model":       "deepseek-ai/deepseek-v4-flash",
-        "use_for":     "explain, summarize, plan, research",
-        "max_tokens":  2048,
-        "temperature": 0.6,
-    },
-    "coder": {
-        "provider":    "openrouter",
-        "model":       "qwen/qwen3-coder-480b:free",
-        "use_for":     "code, debug, build, implement",
-        "max_tokens":  4096,
-        "temperature": 0.3,
-    },
-    "oracle": {
-        "provider":    "nvidia",
-        "model":       "deepseek-ai/deepseek-r1",
-        "use_for":     "complex tasks, deep reasoning, strategy",
-        "max_tokens":  4096,
+        "provider": "nvidia",
+        "model": "meta/llama-3.1-8b-instruct",
+        "max_tokens": 80,
         "temperature": 0.4,
     },
-    "ultra": {
-        "provider":    "nvidia",
-        "model":       "meta/llama-3.1-70b-instruct",
-        "use_for":     "very long documents, large context",
-        "max_tokens":  8192,
+
+    "analyst": {
+        "provider": "nvidia",
+        "model": "meta/llama-3.1-70b-instruct",
+        "max_tokens": 2048,
         "temperature": 0.5,
     },
-    "backup": {
-    "provider": "openrouter",
-    "model": "deepseek/deepseek-chat-v3-0324:free",
-    "use_for": "cloud fallback when all else fails",
-    "max_tokens": 1024,
-    "temperature": 0.7,
-},
-    "backup2": {
-    "provider": "openrouter",
-    "model": "microsoft/phi-3-mini-128k-instruct:free",
-    "use_for": "second fallback",
-    "max_tokens": 512,
-    "temperature": 0.7,
-    },
-    "backup3": {
-    "provider": "openrouter",
-    "model": "huggingfaceh4/zephyr-7b-beta:free",
-    "use_for": "third fallback",
-    "max_tokens": 512,
-    "temperature": 0.7,
-},
-}
 
+    "coder": {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-chat-v3-0324:free",
+        "max_tokens": 2048,
+        "temperature": 0.2,
+    },
+
+    "oracle": {
+        "provider": "nvidia",
+        "model": "deepseek-ai/deepseek-r1",
+        "max_tokens": 4096,
+        "temperature": 0.4,
+    },
+
+    "backup": {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-chat-v3-0324:free",
+        "max_tokens": 512,
+        "temperature": 0.5,
+    },
+
+    "backup2": {
+        "provider": "openrouter",
+        "model": "google/gemma-2-9b-it:free",
+        "max_tokens": 512,
+        "temperature": 0.5,
+    },
+
+    "local_backup": {
+        "provider": "ollama",
+        "model": "llama3.2:3b",
+        "max_tokens": 80,
+        "temperature": 0.4,
+    },
+}
 # Reflex falls back to cloud backup if Ollama is offline
 FALLBACK_CHAINS = {
-    "reflex":  ["reflex",  "backup",  "backup2", "backup3"],
-    "analyst": ["analyst", "reflex",  "backup",  "backup2", "backup3"],
-    "coder":   ["coder",   "oracle",  "analyst", "backup",  "backup2", "backup3"],
-    "oracle":  ["oracle",  "analyst", "backup",  "backup2", "backup3"],
-    "ultra":   ["ultra",   "oracle",  "analyst", "backup",  "backup2", "backup3"],
-    "backup":  ["backup",  "backup2", "backup3"],
-}
 
+    "reflex": [
+        "reflex",
+        "backup",
+        "backup2",
+        "local_backup",
+    ],
+
+    "analyst": [
+        "analyst",
+        "backup",
+        "backup2",
+        "local_backup",
+    ],
+
+    "coder": [
+        "coder",
+        "oracle",
+        "backup",
+        "backup2",
+        "local_backup",
+    ],
+
+    "oracle": [
+        "oracle",
+        "analyst",
+        "backup",
+        "local_backup",
+    ],
+}
 CURRENT_MODE = "auto"
 
 _is_generating = False
@@ -223,7 +233,7 @@ def _make_client(provider: str) -> OpenAI | None:
             api_key="ollama",          # Ollama ignores the key
             base_url=OLLAMA_BASE_URL,
             max_retries=0,
-            timeout=8.0,               # Local is fast; 8s is generous
+            timeout=20.0,               # Local is fast; 8s is generous
         )
 
     elif provider == "nvidia":
@@ -234,7 +244,7 @@ def _make_client(provider: str) -> OpenAI | None:
             api_key=NVIDIA_API_KEY,
             base_url=NVIDIA_BASE_URL,
             max_retries=0,
-            timeout=15.0,
+            timeout=20.0,
         )
 
     else:  # openrouter

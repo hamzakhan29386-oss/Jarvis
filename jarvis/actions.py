@@ -25,11 +25,12 @@ import urllib.parse
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
+from core.paths import user_data_dir
 
 log = logging.getLogger("jarvis.actions")
 
 # ── Data directory for screenshots etc ──────────────────────────────────────
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = user_data_dir() / "data"
 SCREENSHOT_DIR = DATA_DIR / "screenshots"
 
 
@@ -682,3 +683,27 @@ def get_available_actions() -> list:
         {"name": name, "description": info["description"]}
         for name, info in ACTION_REGISTRY.items()
     ]
+
+
+def _load_modular_agents() -> None:
+    """
+    Import modular automation agents so their @action decorators register.
+
+    Kept at the end of this file to preserve the existing action registry while
+    letting new desktop/browser/workflow capabilities live in focused modules.
+    """
+    modules = (
+        "automation.browser_agent",
+        "automation.youtube_agent",
+        "automation.desktop_agent",
+        "automation.system_agent",
+        "automation.workflow_agent",
+    )
+    for module in modules:
+        try:
+            __import__(module)
+        except Exception as exc:
+            log.warning("[Actions] Could not load %s: %s", module, exc)
+
+
+_load_modular_agents()

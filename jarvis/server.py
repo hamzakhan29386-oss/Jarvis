@@ -32,13 +32,15 @@ import traceback
 import json
 import time
 import threading
+from core.paths import resource_path
 from brain import (
     think, think_stream, check_nvidia, check_openrouter, check_gemini,
     check_ollama, set_mode, get_mode, get_session_stats, CURRENT_MODE,
 )
 # ── Production wake word system ──────────────────────────────────────────────
 from wake.service import get_wake_service as _get_production_wake_service
-app = Flask(__name__, static_folder=".", static_url_path="")
+WEB_ROOT = resource_path(".")
+app = Flask(__name__, static_folder=str(WEB_ROOT), static_url_path="")
 
 # ── CORS support ────────────────────────────────────────────────────────────
 @app.after_request
@@ -74,7 +76,7 @@ def _add_to_history(role: str, text: str, model: str = "", tier: str = ""):
 
 @app.route("/")
 def index():
-    return send_from_directory(".", "index.html")
+    return send_from_directory(str(WEB_ROOT), "index.html")
 
 
 @app.route("/health")
@@ -281,6 +283,49 @@ def execute_plan_endpoint():
         )
         result = execute_plan(plan)
         return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/intent/parse", methods=["POST"])
+def parse_intent_endpoint():
+    """Parse raw user text into a structured desktop intent."""
+    data = request.get_json(silent=True)
+    if not data or "message" not in data:
+        return jsonify({"error": "Missing 'message' field"}), 400
+    try:
+        from core.intent_parser import parse_user_intent
+
+        return jsonify(parse_user_intent(data["message"]).to_dict())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/assistant/command", methods=["POST"])
+def assistant_command_endpoint():
+    """Route a command through intent parsing, actions, and brain fallback."""
+    data = request.get_json(silent=True)
+    if not data or "message" not in data:
+        return jsonify({"error": "Missing 'message' field"}), 400
+    try:
+        from core.task_router import route_text
+
+        result = route_text(data["message"], speak=bool(data.get("speak", False)))
+        _add_to_history("user", data["message"])
+        _add_to_history("jarvis", result.get("response", ""), tier=result.get("tier", "router"))
+        return jsonify(result)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/runtime/status")
+def runtime_status_endpoint():
+    """Return status for the persistent desktop runtime when active."""
+    try:
+        from core.assistant_runtime import get_runtime
+
+        return jsonify(get_runtime().status())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

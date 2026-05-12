@@ -35,7 +35,8 @@ let ttsEnabled = false;   // proactive TTS — muted by default, toggled via but
 // ── API URLs ───────────────────────────────────────────────────
 const API = { ask:"/ask", stream:"/ask-stream", health:"/health",
   setMode:"/set-mode", getMode:"/get-mode", sysStatus:"/system-status",
-  convHistory:"/conversation-history" };
+  convHistory:"/conversation-history", parseIntent:"/intent/parse",
+  command:"/assistant/command" };
 
 // ═══════════════════════════════════════════════════════════════
 //  STATE MACHINE
@@ -94,12 +95,14 @@ async function checkHealth() {
     const r = await fetch(API.health, {signal:AbortSignal.timeout(5000)});
     const d = await r.json();
     const e = d.engines || {};
+    const ollamaOnline = e.ollama || e.ollama_local;
     if (engineLabel) {
-      if (e.ollama) engineLabel.textContent = "ENGINE: OLLAMA";
+      if (ollamaOnline) engineLabel.textContent = "ENGINE: OLLAMA";
       else if (e.openrouter) engineLabel.textContent = "ENGINE: OPENROUTER";
+      else if (e.nvidia_nim) engineLabel.textContent = "ENGINE: NVIDIA";
       else engineLabel.textContent = "ENGINE: NONE";
     }
-    if (e.openrouter || e.ollama) {
+    if (e.openrouter || e.nvidia_nim || ollamaOnline) {
       if (currentState === "dormant" || currentState === "idle") setStatus("ONLINE","online");
     } else {
       setStatus("NO ENGINE","offline");
@@ -175,6 +178,9 @@ async function sendMessage() {
   showThinkingDots();
 
   try {
+    const directHandled = await tryDirectCommand(message);
+    if (directHandled) return;
+
     const endpoint = ttsEnabled ? "/voice/realtime-ask" : API.stream;
 const resp = await fetch(endpoint, {
     method: "POST",
@@ -244,6 +250,55 @@ const resp = await fetch(endpoint, {
     userInput.value = "";
     userInput.focus();
   }
+}
+
+async function tryDirectCommand(message) {
+  const intentResp = await fetch(API.parseIntent, {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({message}), signal:AbortSignal.timeout(5000)
+  });
+  if (!intentResp.ok) return false;
+
+  const intent = await intentResp.json();
+  if (intent.needs_ai || intent.action === "chat") return false;
+
+  setState("acting");
+  renderActionIntent(intent);
+
+  const commandResp = await fetch(API.command, {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({message, speak:ttsEnabled}), signal:AbortSignal.timeout(60000)
+  });
+  const result = await commandResp.json();
+  if (!commandResp.ok || result.error) throw new Error(result.error || "Command failed");
+
+  renderActionResult(result);
+  setResponse(result.response || result.action_result || "Done.");
+  if (result.ok === false) showToast(result.action_result || "Action reported a problem", "error");
+  else showToast(result.response || "Action complete", "success");
+  setState("cooldown");
+  return true;
+}
+
+function renderActionIntent(intent) {
+  if (!actionSteps) return;
+  actionSteps.innerHTML = "";
+  const item = document.createElement("div");
+  item.className = "action-step running";
+  item.textContent = `${(intent.action || "action").replaceAll("_"," ")} ${JSON.stringify(intent.args || {})}`;
+  actionSteps.appendChild(item);
+  if (actionProgressBar) actionProgressBar.style.width = "45%";
+}
+
+function renderActionResult(result) {
+  if (!actionSteps) return;
+  const item = actionSteps.querySelector(".action-step");
+  if (item) {
+    item.classList.remove("running");
+    item.classList.add(result.ok === false ? "failed" : "success");
+    item.textContent = result.action_result || result.response || "Complete";
+  }
+  if (actionProgressBar) actionProgressBar.style.width = "100%";
 }
 
 function handleStreamComplete(data, cursor) {

@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 memory_store.json
 venv/
+build/
+dist/
+*.spec.bak
+*.log

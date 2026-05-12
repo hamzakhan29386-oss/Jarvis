@@ -342,7 +342,7 @@ body[data-state="cooldown"] .hud-core { animation:cooldown-dim 1.5s ease-out for
 
 /* ═══ TOAST ═══ */
 .toast {
-  position:fixed; top:64px; left:50%; transform:translateX(-50%) translateY(-20px);
+  position:fixed; bottom:58px; left:50%; transform:translateX(-50%) translateY(20px);
   padding:10px 20px; background:rgba(255,51,68,0.15); border:1px solid rgba(255,51,68,0.3);
   border-radius:6px; color:#ff6b7a; font-family:'Rajdhani',sans-serif; font-size:14px;
   font-weight:500; opacity:0; pointer-events:none; transition:all 0.4s; z-index:200;

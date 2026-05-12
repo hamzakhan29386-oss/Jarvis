@@ -69,6 +69,75 @@ python server.py
 
 Open **http://localhost:5000** in your browser.
 
+## Desktop Runtime
+
+JARVIS can now run as a persistent Windows desktop assistant with a tray icon,
+wake-word listener, supervised background threads, and fast desktop intent
+routing.
+
+```powershell
+# Run in the background with tray controls
+python -m core.launcher --tray --open-ui
+
+# Install Windows Startup launcher
+powershell -ExecutionPolicy Bypass -File scripts\install_startup.ps1
+```
+
+Tray menu:
+- Open JARVIS
+- Mute voice
+- Toggle wake word
+- Restart assistant
+- Quit
+
+Direct commands such as "Play Interstellar docking scene", "Search AI news on
+YouTube", "Open coding setup", "set volume 40", and "take screenshot" are parsed
+locally first and executed through `actions.py`. General conversation still flows
+through `brain.py` with the existing cloud/local fallback routing.
+
+Runtime modules:
+- `core/launcher.py` starts the desktop runtime.
+- `core/assistant_runtime.py` supervises Flask, wake-word events, and routing.
+- `tray/tray_app.py` and `tray/tray_menu.py` own system tray behavior.
+- `automation/` contains modular browser, YouTube, desktop, system, and workflow agents.
+
+## Windows EXE Build
+
+Build an installer-ready desktop executable:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+```
+
+Output:
+
+```text
+dist\JARVIS.exe
+```
+
+The build script generates `assets\jarvis.ico`, installs packaging tools, installs
+Playwright Chromium, and runs PyInstaller with `JARVIS.spec`.
+
+Useful commands:
+
+```powershell
+# Launch packaged app from the tray
+dist\JARVIS.exe --tray
+
+# Register packaged app for Windows startup
+dist\JARVIS.exe --install-startup
+
+# Source fallback startup registration
+scripts\install_startup.bat
+```
+
+For Playwright-powered browser automation, run once after installing
+dependencies:
+
+```powershell
+python -m playwright install chromium
+```
+
 ## 🧠 Cognitive Architecture
 
 JARVIS routes your queries dynamically based on complexity to the following tiers:

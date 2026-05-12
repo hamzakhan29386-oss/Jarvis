@@ -23,6 +23,11 @@ pyautogui
 pyperclip
 plyer
 Pillow
+pystray
+playwright
+pygetwindow
+screen-brightness-control
+pywin32; platform_system == "Windows"
 
 # ── Voice: STT ───────────────────────────────────────────────────────────────
 faster-whisper          # Whisper STT (tiny.en model, ~39MB, int8)
@@ -50,3 +55,4 @@ sentence-transformers   # memory system embeddings
 
 # ── Utilities ────────────────────────────────────────────────────────────────
 python-dotenv
+pyinstaller

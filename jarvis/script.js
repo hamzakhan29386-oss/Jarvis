@@ -175,10 +175,13 @@ async function sendMessage() {
   showThinkingDots();
 
   try {
-    const resp = await fetch(API.stream, {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({message}), signal:AbortSignal.timeout(200000)
-    });
+    const endpoint = ttsEnabled ? "/voice/realtime-ask" : API.stream;
+const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, tts: ttsEnabled }),
+    signal: AbortSignal.timeout(200000),
+});
     if (!resp.ok) throw new Error(`Stream failed: ${resp.status}`);
 
     clearResponse();

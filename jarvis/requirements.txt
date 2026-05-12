@@ -1,31 +1,52 @@
-# JARVIS — 100% Free Dependencies
-# ==================================
+# JARVIS — Dependencies (Hybrid Local + Cloud Edition)
+# ======================================================
+# Install: pip install -r requirements.txt
+#
+# Then pull the local AI model:
+#   ollama pull llama3.2:3b
+#
+# Optional — Piper neural TTS (natural JARVIS voice):
+#   pip install piper-tts
+#   python -c "from piper import download; download('en_US-lessac-medium')"
 
-# Core
+# ── Core ────────────────────────────────────────────────────────────────────
 flask
 requests
 numpy
 
-# OpenAI-compatible client (unified for NVIDIA NIM + OpenRouter)
+# ── OpenAI-compatible client (NVIDIA NIM + OpenRouter + Ollama) ──────────────
 openai>=1.0.0
 
-# System automation
+# ── System automation ────────────────────────────────────────────────────────
 psutil
 pyautogui
 pyperclip
 plyer
 Pillow
 
-# Voice
-pyttsx3
-faster-whisper
-sounddevice
-soundfile
-TTS
-openwakeword
+# ── Voice: STT ───────────────────────────────────────────────────────────────
+faster-whisper          # Whisper STT (tiny.en model, ~39MB, int8)
+sounddevice             # microphone input + audio playback
+soundfile               # audio file I/O
 
-# NLP / Embeddings
-sentence-transformers
+# ── Voice: TTS ───────────────────────────────────────────────────────────────
+pyttsx3                 # fast offline TTS (always available, subprocess mode)
+piper-tts               # OPTIONAL — neural TTS, natural voice (~50MB model)
+                        # If install fails, pyttsx3 is used automatically.
+                        # After install: python -c "from piper import download; download('en_US-lessac-medium')"
 
-# Utilities
+# ── Voice: Wake Word ─────────────────────────────────────────────────────────
+openwakeword            # "Hey JARVIS" detection
+
+# ── Voice: VAD ───────────────────────────────────────────────────────────────
+# silero-vad via torch — installed below:
+torch                   # needed for silero-vad (CPU only is fine)
+
+# ── NLP / Embeddings ─────────────────────────────────────────────────────────
+sentence-transformers   # memory system embeddings
+
+# ── Coqui TTS (optional — larger natural voice, ~1.5GB) ─────────────────────
+# TTS                   # uncomment if you want Coqui as TTS option
+
+# ── Utilities ────────────────────────────────────────────────────────────────
 python-dotenv

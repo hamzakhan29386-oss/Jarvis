@@ -1,28 +1,30 @@
 """
-voice.py — JARVIS Voice Engine (100% Free, Local)
-====================================================
-Modular voice system with STT, TTS, VAD, and wake word detection.
-All components are free and run locally — no API keys needed.
+voice.py — JARVIS Voice Engine (Real-Time Streaming Pipeline)
+==============================================================
+UPGRADED PIPELINE:
+  OLD: listen → wait → full AI response → TTS → play
+  NEW: listen → stream tokens → speak sentence-by-sentence immediately
+
+Key additions:
+  • StreamingSpeaker  — buffers tokens, speaks each sentence as it completes
+  • PiperTTS          — fast neural TTS (optional, ~50MB model, natural voice)
+  • Tighter VAD       — 0.5s silence timeout (was 1.5s)
+  • stream_speak()    — VoiceEngine method for the new pipeline
 
 Stack:
-    STT:       faster-whisper (tiny.en, ~39MB, <100ms)
-    TTS:       pyttsx3 (instant, offline) + Coqui TTS (natural voice)
+    STT:       faster-whisper (tiny.en, ~39MB, int8)
+    TTS:       Piper (neural, offline) with pyttsx3 fallback
     VAD:       silero-vad (voice activity detection)
     Wake Word: openwakeword ("hey jarvis")
-    Audio:     pyaudio (mic input)
-
-Usage:
-    from voice import VoiceEngine
-    engine = VoiceEngine()
-    engine.speak("Good morning, sir.")
-    text = engine.listen()
 """
 
 import os
+import re
 import io
 import sys
 import wave
 import time
+import queue
 import logging
 import subprocess
 import threading
@@ -33,25 +35,245 @@ log = logging.getLogger("jarvis.voice")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TTS ENGINES
+#  STREAMING SPEAKER — core of the new real-time pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class StreamingSpeaker:
+    """
+    Sentence-level streaming TTS.
+
+    Feed tokens one at a time. The speaker detects sentence boundaries
+    and queues each completed sentence for playback immediately —
+    so JARVIS starts speaking before the AI finishes generating.
+
+    Usage:
+        speaker = StreamingSpeaker(tts_engine)
+        for token in think_stream(prompt):
+            speaker.feed_token(token)
+        speaker.flush()          # speak any trailing text
+        speaker.wait_done()      # block until all audio finishes
+    """
+
+    # Sentence-ending pattern: . ! ? followed by space, newline, or end of string
+    _SENTENCE_END = re.compile(r'(?<=[.!?])\s+|(?<=[.!?])$')
+    # Also split on newlines that separate paragraphs
+    _PARA_SPLIT   = re.compile(r'\n{2,}')
+
+    def __init__(self, tts_engine):
+        self._tts    = tts_engine
+        self._buffer = ""
+        self._queue  = queue.Queue(maxsize=16)
+        self._done   = threading.Event()
+        self._active = True
+        self._worker = threading.Thread(
+            target=self._worker_loop, daemon=True, name="tts-streamer"
+        )
+        self._worker.start()
+
+    # ── Internal TTS worker ──────────────────────────────────────────────
+
+    def _worker_loop(self):
+        """Background thread: dequeue sentences and speak them one by one."""
+        while self._active:
+            try:
+                sentence = self._queue.get(timeout=1.0)
+                if sentence is None:      # poison pill — shut down
+                    break
+                if sentence.strip():
+                    self._tts.speak(sentence.strip())
+                self._queue.task_done()
+            except queue.Empty:
+                continue
+        self._done.set()
+
+    def _enqueue(self, sentence: str):
+        """Push a sentence to the playback queue (non-blocking)."""
+        if sentence.strip():
+            try:
+                self._queue.put_nowait(sentence.strip())
+            except queue.Full:
+                # Queue full: block briefly rather than drop audio
+                try:
+                    self._queue.put(sentence.strip(), timeout=5.0)
+                except queue.Full:
+                    log.warning("[StreamingSpeaker] Queue full, dropping sentence")
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def feed_token(self, token: str):
+        """
+        Add a token to the buffer. Speak any completed sentences immediately.
+        Call this for every token from think_stream().
+        """
+        self._buffer += token
+
+        # Check for sentence boundaries
+        parts = self._SENTENCE_END.split(self._buffer)
+        if len(parts) > 1:
+            # parts[-1] is the incomplete tail; everything before is a sentence
+            for sentence in parts[:-1]:
+                self._enqueue(sentence)
+            self._buffer = parts[-1]
+
+        # Also handle paragraph breaks
+        paras = self._PARA_SPLIT.split(self._buffer)
+        if len(paras) > 1:
+            for para in paras[:-1]:
+                if para.strip():
+                    self._enqueue(para)
+            self._buffer = paras[-1]
+
+    def feed_tokens(self, token_generator):
+        """
+        Convenience method: iterate a token generator and feed each token.
+        Automatically flushes when the generator is exhausted.
+        """
+        for token in token_generator:
+            self.feed_token(token)
+        self.flush()
+
+    def flush(self):
+        """Speak any text remaining in the buffer (call after stream ends)."""
+        if self._buffer.strip():
+            self._enqueue(self._buffer)
+            self._buffer = ""
+
+    def wait_done(self, timeout: float = 60.0):
+        """Block until the TTS queue is empty and all audio has played."""
+        self._queue.join()
+
+    def stop(self):
+        """Interrupt playback and shut down the worker."""
+        self._active = False
+        # Drain the queue
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                break
+        self._queue.put(None)   # poison pill
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PIPER TTS — fast neural voice (optional)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PiperTTS:
+    """
+    Neural TTS using Piper — natural-sounding, offline, ~50ms latency.
+
+    Setup (one-time):
+        pip install piper-tts
+        python -c "from piper import download; download('en_US-lessac-medium')"
+
+    Falls back to Pyttsx3TTS if Piper is not installed or model not found.
+    """
+
+    # Default voice — sounds natural and relatively deep
+    DEFAULT_VOICE = "en_US-lessac-medium"
+
+    def __init__(self, voice: str = DEFAULT_VOICE):
+        self._voice_name = voice
+        self._voice      = None
+        self._lock       = threading.Lock()
+        self._ready      = threading.Event()
+        self._init_error = None
+        # Load model in background so startup is non-blocking
+        threading.Thread(target=self._load, daemon=True, name="piper-init").start()
+
+    def _load(self):
+        """Load the Piper voice model (downloads on first use if needed)."""
+        try:
+            from piper.voice import PiperVoice
+            # Try to locate an ONNX model file in common locations
+            model_paths = [
+                Path.home() / ".local/share/piper" / f"{self._voice_name}.onnx",
+                Path(__file__).parent / "voices" / f"{self._voice_name}.onnx",
+                Path(f"{self._voice_name}.onnx"),
+            ]
+            model_file = next((p for p in model_paths if p.exists()), None)
+
+            if model_file is None:
+                log.info(f"[Piper] Model not found locally — downloading {self._voice_name}...")
+                try:
+                    from piper import download as piper_download
+                    model_file = piper_download(self._voice_name)
+                except Exception as dl_err:
+                    raise RuntimeError(
+                        f"Could not find or download Piper voice '{self._voice_name}'. "
+                        f"Run: python -m piper --download-voices  ({dl_err})"
+                    )
+
+            self._voice = PiperVoice.load(str(model_file))
+            log.info(f"[Piper] Voice loaded: {self._voice_name}")
+            self._ready.set()
+
+        except ImportError:
+            self._init_error = (
+                "piper-tts not installed. "
+                "Run: pip install piper-tts  (falls back to pyttsx3)"
+            )
+            log.warning(f"[Piper] {self._init_error}")
+            self._ready.set()
+        except Exception as e:
+            self._init_error = str(e)
+            log.warning(f"[Piper] Init failed: {e}")
+            self._ready.set()
+
+    def _wait_ready(self, timeout: float = 10.0) -> bool:
+        return self._ready.wait(timeout=timeout) and self._voice is not None
+
+    def speak(self, text: str):
+        """Synthesise and play text synchronously."""
+        if not text.strip():
+            return
+        if not self._wait_ready():
+            log.warning("[Piper] Not ready — skipping utterance")
+            return
+        with self._lock:
+            try:
+                import sounddevice as sd
+                import numpy as np
+
+                cfg = self._voice.config
+                sample_rate = cfg.sample_rate
+
+                audio_chunks = []
+                for raw in self._voice.synthesize_stream_raw(text):
+                    audio_chunks.append(np.frombuffer(raw, dtype=np.int16))
+
+                if audio_chunks:
+                    audio = np.concatenate(audio_chunks).astype(np.float32) / 32768.0
+                    sd.play(audio, sample_rate)
+                    sd.wait()
+
+            except Exception as e:
+                log.error(f"[Piper] Speak error: {e}")
+
+    def speak_async(self, text: str) -> threading.Thread:
+        t = threading.Thread(target=self.speak, args=(text,), daemon=True)
+        t.start()
+        return t
+
+    def stop(self):
+        pass
+
+    @property
+    def is_available(self) -> bool:
+        return self._ready.is_set() and self._voice is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PYTTSX3 TTS — fast pyttsx3 subprocess (original, always available)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Pyttsx3TTS:
     """
     Windows TTS via subprocess isolation.
-
-    pyttsx3 with SAPI5 (Windows COM) has strict thread-affinity requirements.
-    Even with a dedicated worker thread, runAndWait() can silently drop audio
-    when called from a non-main Flask thread because the COM STA message pump
-    doesn't always get properly serviced.
-
-    Fix: spawn a fresh Python subprocess per utterance.  The subprocess owns
-    its own main thread, its own COM context, and its own SAPI5 session.
-    Completely bypasses all threading issues.  speak_async() is fire-and-forget;
-    speak() blocks until the subprocess exits.
+    Spawns a fresh Python subprocess per utterance to avoid COM thread issues.
     """
 
-    # One-liner script run in each subprocess
     _SAPI_SCRIPT = (
         "import sys, pyttsx3; "
         "e = pyttsx3.init(); "
@@ -61,7 +283,6 @@ class Pyttsx3TTS:
         "e.runAndWait()"
     )
 
-    # PowerShell fallback (always available on Windows, no pip deps)
     _PS_SCRIPT = (
         "Add-Type -AssemblyName System.Speech; "
         "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
@@ -71,58 +292,42 @@ class Pyttsx3TTS:
 
     def __init__(self):
         self._init_error = None
-        self._ready = threading.Event()
-        self._ready.set()    # always ready — no warmup needed
-        # Detect preferred method
+        self._ready      = threading.Event()
+        self._ready.set()
         self._use_ps = False
         try:
-            import pyttsx3  # noqa: just check importability
+            import pyttsx3  # noqa
             log.info("[Voice] pyttsx3 TTS ready (subprocess mode)")
         except ImportError:
             self._use_ps = True
-            log.warning("[Voice] pyttsx3 not found — falling back to PowerShell SAPI")
+            log.warning("[Voice] pyttsx3 not found — using PowerShell SAPI fallback")
 
     def _run_subprocess(self, text: str) -> subprocess.Popen:
-        """Launch a TTS subprocess and return the Popen handle."""
-        import shlex
-        # Sanitise: remove characters that would break the script
         safe = text.replace('"', "'").replace('\n', ' ').replace('\r', '')
-        safe = ''.join(c for c in safe if ord(c) < 128)   # ASCII only for SAPI5
-
+        safe = ''.join(c for c in safe if ord(c) < 128)
         if self._use_ps:
-            # PowerShell fallback
-            cmd = ["powershell", "-NonInteractive", "-Command",
-                   self._PS_SCRIPT, safe]
+            cmd = ["powershell", "-NonInteractive", "-Command", self._PS_SCRIPT, safe]
         else:
-            # pyttsx3 in isolated subprocess
             cmd = [sys.executable, "-c", self._SAPI_SCRIPT, safe]
-
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def speak(self, text: str):
-        """Speak text and block until playback finishes."""
         if not text:
             return
         proc = self._run_subprocess(text)
         proc.wait(timeout=30)
 
-    def speak_async(self, text: str):
-        """Spawn TTS subprocess and return immediately (fire-and-forget)."""
+    def speak_async(self, text: str) -> threading.Thread:
         if not text:
             return threading.Thread()
-        log.info(f"[Voice] TTS speaking ({len(text)} chars)")
+        log.info(f"[Voice] TTS: {len(text)} chars")
         proc = self._run_subprocess(text)
-        # Reap the process in a tiny background thread so it doesn't become a zombie
         t = threading.Thread(target=proc.wait, daemon=True, name="tts-reaper")
         t.start()
         return t
 
     def stop(self):
-        pass   # no persistent resources to clean up
+        pass
 
 
 class CoquiTTS:
@@ -130,33 +335,30 @@ class CoquiTTS:
 
     def __init__(self):
         self._model = None
-        self._lock = threading.Lock()
+        self._lock  = threading.Lock()
 
     def _init_model(self):
         if self._model is None:
             try:
                 from TTS.api import TTS as CoquiTTSAPI
-                log.info("[Voice] Loading Coqui TTS model (first run downloads ~1.5GB)...")
+                log.info("[Voice] Loading Coqui TTS model...")
                 self._model = CoquiTTSAPI(model_name="tts_models/en/ljspeech/tacotron2-DDC")
                 log.info("[Voice] Coqui TTS initialized")
             except ImportError:
-                log.error("[Voice] Coqui TTS not installed! Run: pip install TTS")
+                log.error("[Voice] Coqui TTS not installed. Run: pip install TTS")
                 raise
 
     def speak(self, text: str):
-        """Speak text using Coqui TTS (writes to temp file, plays it)."""
         with self._lock:
             self._init_model()
             try:
                 tmp_path = os.path.join(tempfile.gettempdir(), "jarvis_tts.wav")
                 self._model.tts_to_file(text=text, file_path=tmp_path)
-                # Play the audio file
                 self._play_audio(tmp_path)
             except Exception as e:
                 log.error(f"[Voice] Coqui TTS error: {e}")
 
     def _play_audio(self, filepath: str):
-        """Play a WAV file using sounddevice (no PortAudio headers needed)."""
         try:
             import sounddevice as sd
             import soundfile as sf
@@ -164,9 +366,7 @@ class CoquiTTS:
             sd.play(data, samplerate)
             sd.wait()
         except Exception as e:
-            # Fallback: Windows system player
             try:
-                import subprocess
                 subprocess.Popen(
                     f'start /min "" "{filepath}"', shell=True,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -174,24 +374,23 @@ class CoquiTTS:
             except Exception:
                 log.error(f"[Voice] Could not play audio: {e}")
 
-    def speak_async(self, text: str):
-        """Speak in background thread."""
+    def speak_async(self, text: str) -> threading.Thread:
         t = threading.Thread(target=self.speak, args=(text,), daemon=True)
         t.start()
         return t
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STT ENGINE (faster-whisper)
+#  STT ENGINE (faster-whisper) — unchanged, already fast
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WhisperSTT:
-    """Speech-to-text using faster-whisper (tiny.en, ~39MB, free)."""
+    """Speech-to-text using faster-whisper (tiny.en, ~39MB, int8)."""
 
     def __init__(self, model_size: str = "tiny.en"):
-        self._model = None
+        self._model      = None
         self._model_size = model_size
-        self._lock = threading.Lock()
+        self._lock       = threading.Lock()
 
     def _init_model(self):
         if self._model is None:
@@ -203,45 +402,30 @@ class WhisperSTT:
                 )
                 log.info("[Voice] Whisper STT initialized")
             except ImportError:
-                log.error("[Voice] faster-whisper not installed! Run: pip install faster-whisper")
+                log.error("[Voice] faster-whisper not installed. Run: pip install faster-whisper")
                 raise
 
     def transcribe(self, audio_data: bytes, sample_rate: int = 16000) -> str:
-        """
-        Transcribe audio bytes to text.
-
-        Args:
-            audio_data: Raw PCM audio bytes (16-bit, mono).
-            sample_rate: Audio sample rate (default 16000).
-
-        Returns:
-            Transcribed text string.
-        """
         with self._lock:
             self._init_model()
             try:
-                # Write to temp WAV file for faster-whisper
                 tmp_path = os.path.join(tempfile.gettempdir(), "jarvis_stt.wav")
                 with wave.open(tmp_path, 'wb') as wf:
                     wf.setnchannels(1)
-                    wf.setsampwidth(2)  # 16-bit
+                    wf.setsampwidth(2)
                     wf.setframerate(sample_rate)
                     wf.writeframes(audio_data)
-
                 segments, _ = self._model.transcribe(
-                    tmp_path, beam_size=3, language="en",
-                    vad_filter=True,
+                    tmp_path, beam_size=3, language="en", vad_filter=True,
                 )
                 text = " ".join(s.text for s in segments).strip()
-                log.info(f"[Voice] Transcribed: {text[:80]}...")
+                log.info(f"[Voice] Transcribed: {text[:80]}")
                 return text
-
             except Exception as e:
                 log.error(f"[Voice] Transcription error: {e}")
                 return ""
 
     def transcribe_file(self, filepath: str) -> str:
-        """Transcribe an audio file directly."""
         with self._lock:
             self._init_model()
             try:
@@ -255,20 +439,20 @@ class WhisperSTT:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  VOICE ACTIVITY DETECTION (silero-vad)
+#  VAD — tighter silence detection
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class VoiceActivityDetector:
-    """Detect when the user starts/stops speaking using silero-vad."""
+    """Detect speech using silero-vad."""
 
     def __init__(self, threshold: float = 0.5):
-        self._model = None
-        self._threshold = threshold
-        self._unavailable = False   # set True after first failed load so we stop retrying
+        self._model      = None
+        self._threshold  = threshold
+        self._unavailable = False
 
     def _init_model(self):
         if self._unavailable or self._model is not None:
-            return   # already failed or already loaded — don't retry every chunk
+            return
         try:
             import torch
             self._model, self._utils = torch.hub.load(
@@ -279,15 +463,13 @@ class VoiceActivityDetector:
             )
             log.info("[Voice] Silero VAD initialized")
         except Exception as e:
-            log.warning(f"[Voice] Silero VAD not available: {e} — will assume speech for all chunks")
-            self._unavailable = True   # stop spamming the log on every chunk
+            log.warning(f"[Voice] Silero VAD not available: {e}")
+            self._unavailable = True
 
     def is_speech(self, audio_chunk: bytes, sample_rate: int = 16000) -> bool:
-        """Check if an audio chunk contains speech."""
         self._init_model()
         if self._model is None:
-            return True  # Assume speech if VAD unavailable
-
+            return True
         try:
             import torch
             import numpy as np
@@ -300,11 +482,11 @@ class VoiceActivityDetector:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  WAKE WORD DETECTION (openwakeword)
+#  WAKE WORD DETECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WakeWordDetector:
-    """Detect "Hey JARVIS" wake word using openwakeword (free, local)."""
+    """Detect 'Hey JARVIS' using openwakeword."""
 
     def __init__(self):
         self._model = None
@@ -317,17 +499,13 @@ class WakeWordDetector:
                     wakeword_models=["hey_jarvis_v0.1"],
                     inference_framework="onnx",
                 )
-                log.info("[Voice] Wake word detector initialized (hey_jarvis_v0.1)")
+                log.info("[Voice] Wake word detector initialized")
             except ImportError:
-                log.warning(
-                    "[Voice] openwakeword not installed. "
-                    "Run: pip install openwakeword"
-                )
+                log.warning("[Voice] openwakeword not installed. Run: pip install openwakeword")
             except Exception as e:
                 log.warning(f"[Voice] Wake word init failed: {e}")
 
     def detect(self, audio_chunk: bytes) -> bool:
-        """Check if audio chunk contains the wake word."""
         self._init_model()
         if self._model is None:
             return False
@@ -352,39 +530,42 @@ class WakeWordDetector:
 class VoiceEngine:
     """
     Complete voice system for JARVIS.
-    All components are free and run locally.
 
-    Usage:
-        engine = VoiceEngine(tts_engine="pyttsx3")
-        engine.speak("Hello, sir.")
-        text = engine.listen()
+    NEW in this version:
+        stream_speak(token_generator) — speaks sentence-by-sentence as tokens arrive
+        Tighter silence detection: 0.5s default (was 1.5s)
+        PiperTTS option for natural neural voice
     """
 
     def __init__(self, tts_engine: str = "pyttsx3"):
-        """
-        Initialize the voice engine.
-
-        Args:
-            tts_engine: "pyttsx3" (instant, default) or "coqui" (natural voice)
-        """
-        self.is_speaking = False
+        self.is_speaking  = False
         self.is_listening = False
-        self._stop_flag = threading.Event()
+        self._stop_flag   = threading.Event()
 
-        # ── Initialize TTS ──────────────────────────────────────────────
-        if tts_engine == "coqui":
+        # ── TTS selection ────────────────────────────────────────────────
+        if tts_engine == "piper":
+            self._tts = PiperTTS()
+            # If Piper fails to load, fall back to pyttsx3
+            threading.Thread(target=self._check_piper_fallback, daemon=True).start()
+        elif tts_engine == "coqui":
             self._tts = CoquiTTS()
         else:
             self._tts = Pyttsx3TTS()
         self._tts_engine_name = tts_engine
 
-        # ── Lazy-loaded components ──────────────────────────────────────
-        self._stt = None
-        self._vad = None
+        self._stt       = None
+        self._vad       = None
         self._wake_word = None
-        self._pyaudio = None
 
         log.info(f"[Voice] Engine initialized (TTS: {tts_engine})")
+
+    def _check_piper_fallback(self):
+        """After Piper's init window, fall back to pyttsx3 if unavailable."""
+        time.sleep(12)
+        if isinstance(self._tts, PiperTTS) and not self._tts.is_available:
+            log.warning("[Voice] Piper unavailable — switching to pyttsx3 fallback")
+            self._tts = Pyttsx3TTS()
+            self._tts_engine_name = "pyttsx3_fallback"
 
     def _get_stt(self) -> WhisperSTT:
         if self._stt is None:
@@ -401,10 +582,9 @@ class VoiceEngine:
             self._wake_word = WakeWordDetector()
         return self._wake_word
 
-    # ── TTS ─────────────────────────────────────────────────────────────
+    # ── Standard TTS ─────────────────────────────────────────────────────
 
     def speak(self, text: str):
-        """Speak text using the configured TTS engine."""
         if not text:
             return
         self.is_speaking = True
@@ -416,14 +596,13 @@ class VoiceEngine:
             self.is_speaking = False
 
     def speak_async(self, text: str) -> threading.Thread:
-        """Speak text in a background thread (non-blocking)."""
         self.is_speaking = True
 
         def _speak():
             try:
                 self._tts.speak(text)
             except Exception as e:
-                log.error(f"[Voice] TTS error: {e}")
+                log.error(f"[Voice] TTS async error: {e}")
             finally:
                 self.is_speaking = False
 
@@ -431,52 +610,87 @@ class VoiceEngine:
         t.start()
         return t
 
-    def speak_streaming(self, text_generator):
+    # ── STREAMING SPEAK — NEW ─────────────────────────────────────────────
+
+    def stream_speak(self, token_generator, on_sentence: callable = None) -> StreamingSpeaker:
         """
-        Speak text sentence-by-sentence as the AI generates it.
-        Starts speaking the first sentence while the rest is being generated.
+        Real-time streaming TTS pipeline.
+
+        Iterates a token generator (from think_stream), feeds each token into
+        a StreamingSpeaker that starts playing audio as soon as the first
+        sentence is complete — before the AI has even finished responding.
 
         Args:
-            text_generator: Iterator yielding text chunks.
+            token_generator: Any iterable of string tokens.
+            on_sentence: Optional callback(sentence_text) called before each utterance.
+
+        Returns:
+            The StreamingSpeaker (call .wait_done() to block until audio finishes).
+
+        Example:
+            gen = (chunk["token"] for chunk in think_stream(prompt) if "token" in chunk)
+            speaker = engine.stream_speak(gen)
+            speaker.wait_done()
+        """
+
+        class _InstrumentedSpeaker(StreamingSpeaker):
+            def _enqueue(inner_self, sentence: str):
+                if on_sentence and sentence.strip():
+                    try:
+                        on_sentence(sentence.strip())
+                    except Exception:
+                        pass
+                super()._enqueue(sentence)
+
+        speaker = _InstrumentedSpeaker(self._tts) if on_sentence else StreamingSpeaker(self._tts)
+
+        def _run():
+            try:
+                for token in token_generator:
+                    speaker.feed_token(token)
+                speaker.flush()
+            except Exception as e:
+                log.error(f"[Voice] stream_speak error: {e}")
+
+        threading.Thread(target=_run, daemon=True, name="stream-speak").start()
+        return speaker
+
+    def speak_streaming_text(self, text_generator):
+        """
+        Legacy method — speaks a text generator sentence-by-sentence.
+        Kept for backward compat. Prefer stream_speak() for token streams.
         """
         buffer = ""
-        sentence_ends = ".!?;\n"
-
         for chunk in text_generator:
             buffer += chunk
-            # Check if we have a complete sentence
-            for i, char in enumerate(buffer):
-                if char in sentence_ends and i > 10:
-                    sentence = buffer[:i+1].strip()
-                    buffer = buffer[i+1:]
-                    if sentence:
-                        self.speak(sentence)
-                    if self._stop_flag.is_set():
-                        return
-                    break
-
-        # Speak remaining buffer
+            sentences = re.split(r'(?<=[.!?])\s+', buffer)
+            if len(sentences) > 1:
+                for s in sentences[:-1]:
+                    if s.strip():
+                        self.speak(s.strip())
+                buffer = sentences[-1]
+            if self._stop_flag.is_set():
+                return
         if buffer.strip():
             self.speak(buffer.strip())
 
     def stop_speaking(self):
-        """Interrupt current speech."""
         self._stop_flag.set()
         self.is_speaking = False
         log.info("[Voice] Speech interrupted")
 
     # ── STT ─────────────────────────────────────────────────────────────
 
-    def listen(self, timeout: float = 5.0, silence_timeout: float = 1.5) -> str:
+    def listen(
+        self,
+        timeout: float = 5.0,
+        silence_timeout: float = 0.5,   # ← tightened from 1.5s to 0.5s
+    ) -> str:
         """
         Listen for speech and transcribe it.
 
-        Args:
-            timeout: Maximum listening duration in seconds.
-            silence_timeout: Stop after this many seconds of silence.
-
-        Returns:
-            Transcribed text string, or empty string if nothing detected.
+        silence_timeout is now 0.5s by default (was 1.5s) so the pipeline
+        feels snappier — JARVIS stops waiting sooner after you finish speaking.
         """
         self.is_listening = True
         self._stop_flag.clear()
@@ -485,37 +699,37 @@ class VoiceEngine:
             import sounddevice as sd
             import numpy as np
 
-            RATE = 16000
-            CHUNK = 1024
+            RATE     = 16000
+            CHUNK    = 1024
             CHANNELS = 1
 
-            frames = []
+            frames        = []
             silence_start = None
-            start_time = time.time()
-            vad = self._get_vad()
+            start_time    = time.time()
+            vad           = self._get_vad()
 
             log.info("[Voice] Listening...")
 
             def callback(indata, frame_count, time_info, status):
                 frames.append(indata.copy())
 
-            with sd.InputStream(samplerate=RATE, channels=CHANNELS,
-                                dtype="int16", blocksize=CHUNK,
-                                callback=callback):
+            with sd.InputStream(
+                samplerate=RATE, channels=CHANNELS, dtype="int16",
+                blocksize=CHUNK, callback=callback
+            ):
                 while not self._stop_flag.is_set():
-                    elapsed = time.time() - start_time
-                    if elapsed > timeout:
+                    if time.time() - start_time > timeout:
                         break
                     if frames:
                         chunk_bytes = frames[-1].tobytes()
-                        has_speech = vad.is_speech(chunk_bytes, RATE)
+                        has_speech  = vad.is_speech(chunk_bytes, RATE)
                         if has_speech:
                             silence_start = None
                         else:
                             if silence_start is None:
                                 silence_start = time.time()
                             elif time.time() - silence_start > silence_timeout:
-                                log.info("[Voice] Silence detected, stopping...")
+                                log.info("[Voice] Silence detected — stopping")
                                 break
                     time.sleep(0.05)
 
@@ -524,13 +738,13 @@ class VoiceEngine:
                 return ""
 
             audio_data = np.concatenate(frames, axis=0).tobytes()
-            stt = self._get_stt()
-            text = stt.transcribe(audio_data, RATE)
+            stt        = self._get_stt()
+            text       = stt.transcribe(audio_data, RATE)
             self.is_listening = False
             return text
 
         except ImportError:
-            log.error("[Voice] sounddevice not installed! Run: pip install sounddevice")
+            log.error("[Voice] sounddevice not installed. Run: pip install sounddevice")
             self.is_listening = False
             return ""
         except Exception as e:
@@ -538,38 +752,30 @@ class VoiceEngine:
             self.is_listening = False
             return ""
 
-    # ── Wake Word ───────────────────────────────────────────────────────
+    # ── Wake Word ────────────────────────────────────────────────────────
 
     def listen_for_wake_word(self, callback=None):
-        """
-        Continuously listen for "Hey JARVIS" wake word.
-        When detected, calls callback() or returns True.
-
-        Args:
-            callback: Optional function to call when wake word is detected.
-
-        Returns:
-            True if wake word detected (when no callback provided).
-        """
         try:
             import sounddevice as sd
             import numpy as np
-            RATE = 16000
-            CHUNK = 1280  # 80ms at 16kHz — required by openwakeword
+            RATE  = 16000
+            CHUNK = 1280
 
             wake_detector = self._get_wake_word()
             log.info("[Voice] Listening for wake word ('Hey JARVIS')...")
 
-            buf = np.zeros((CHUNK,), dtype="int16")
+            buf      = np.zeros((CHUNK,), dtype="int16")
             buf_lock = threading.Event()
 
-            def callback(indata, frames, time_info, status):
+            def _cb(indata, frames, time_info, status):
                 nonlocal buf
                 buf = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
                 buf_lock.set()
 
-            with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                                blocksize=CHUNK, callback=callback):
+            with sd.InputStream(
+                samplerate=RATE, channels=1, dtype="int16",
+                blocksize=CHUNK, callback=_cb
+            ):
                 while not self._stop_flag.is_set():
                     buf_lock.wait(timeout=1.0)
                     buf_lock.clear()
@@ -577,21 +783,22 @@ class VoiceEngine:
                         if callback:
                             callback()
                         return True
-
             return False
 
         except ImportError:
-            log.error("[Voice] sounddevice not installed! Run: pip install sounddevice")
+            log.error("[Voice] sounddevice not installed.")
             return False
         except Exception as e:
             log.error(f"[Voice] Wake word error: {e}")
             return False
 
-    # ── Engine Management ───────────────────────────────────────────────
+    # ── Engine management ────────────────────────────────────────────────
 
     def switch_tts(self, engine: str):
-        """Switch TTS engine at runtime: 'pyttsx3' or 'coqui'."""
-        if engine == "coqui":
+        """Switch TTS engine at runtime: 'pyttsx3', 'piper', or 'coqui'."""
+        if engine == "piper":
+            self._tts = PiperTTS()
+        elif engine == "coqui":
             self._tts = CoquiTTS()
         else:
             self._tts = Pyttsx3TTS()
@@ -599,71 +806,54 @@ class VoiceEngine:
         log.info(f"[Voice] TTS switched to: {engine}")
 
     def get_status(self) -> dict:
-        """Return voice engine status."""
         return {
-            "tts_engine": self._tts_engine_name,
-            "is_speaking": self.is_speaking,
-            "is_listening": self.is_listening,
-            "stt_loaded": self._stt is not None,
-            "vad_loaded": self._vad is not None,
+            "tts_engine":       self._tts_engine_name,
+            "is_speaking":      self.is_speaking,
+            "is_listening":     self.is_listening,
+            "stt_loaded":       self._stt is not None,
+            "vad_loaded":       self._vad is not None,
             "wake_word_loaded": self._wake_word is not None,
+            "piper_available":  isinstance(self._tts, PiperTTS) and self._tts.is_available,
         }
 
     def stop(self):
-        """Stop all voice activity."""
         self._stop_flag.set()
-        self.is_speaking = False
+        self.is_speaking  = False
         self.is_listening = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  WAKE WORD SERVICE — background daemon with SSE event queue
+#  WAKE WORD SERVICE (unchanged from original, already solid)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-import queue
 
 class WakeWordService:
     """
-    Background service that continuously listens for "Hey JARVIS",
-    then immediately captures and transcribes the follow-up command.
+    Background service: listen for 'Hey JARVIS', capture command, publish transcript.
 
-    Events pushed to subscribers via a queue:
-        {"event": "detected"}                        — wake word heard
-        {"event": "listening"}                       — mic open, capturing command
-        {"event": "transcript", "text": "..."}       — STT result ready
-        {"event": "error", "message": "..."}         — something went wrong
-        {"event": "unavailable", "message": "..."}   — deps missing
-
-    Usage:
-        svc = get_wake_service()
-        svc.enable()
-        for event in svc.subscribe():   # blocks, yields dicts
-            print(event)
+    Events pushed to subscribers:
+        {"event": "detected"}
+        {"event": "listening"}
+        {"event": "transcript", "text": "..."}
+        {"event": "error", "message": "..."}
+        {"event": "heartbeat"}
     """
 
     def __init__(self):
-        self._enabled = False
-        self._thread = None
-        self._stop = threading.Event()
+        self._enabled     = False
+        self._thread      = None
+        self._stop        = threading.Event()
         self._subscribers: list[queue.Queue] = []
-        self._sub_lock = threading.Lock()
+        self._sub_lock    = threading.Lock()
         self._voice: VoiceEngine | None = None
 
-    # ── Subscriber pub/sub ───────────────────────────────────────────────
-
     def subscribe(self):
-        """
-        Generator — yields event dicts as they arrive.
-        Each caller gets its own queue so multiple SSE clients work fine.
-        Automatically cleans up when the generator is closed.
-        """
         q: queue.Queue = queue.Queue(maxsize=32)
         with self._sub_lock:
             self._subscribers.append(q)
         try:
             while True:
                 try:
-                    yield q.get(timeout=30)   # 30s heartbeat timeout
+                    yield q.get(timeout=30)
                 except queue.Empty:
                     yield {"event": "heartbeat"}
         finally:
@@ -679,22 +869,20 @@ class WakeWordService:
                 try:
                     q.put_nowait(event)
                 except queue.Full:
-                    pass   # slow consumer — drop event rather than block
-
-    # ── Lifecycle ────────────────────────────────────────────────────────
+                    pass
 
     def enable(self):
-        """Start the background listener thread."""
         if self._enabled:
             return
         self._enabled = True
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="WakeWordService")
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="WakeWordService"
+        )
         self._thread.start()
         log.info("[WakeWord] Service enabled")
 
     def disable(self):
-        """Stop the background listener thread."""
         self._enabled = False
         self._stop.set()
         log.info("[WakeWord] Service disabled")
@@ -702,61 +890,55 @@ class WakeWordService:
     def is_enabled(self) -> bool:
         return self._enabled
 
-    # ── Main loop ────────────────────────────────────────────────────────
-
     def _loop(self):
-        """Continuously detect wake word → capture command → publish transcript."""
         try:
             import sounddevice as sd
             import numpy as np
         except ImportError as e:
-            self._publish({"event": "unavailable", "message": f"Missing dependency: {e}. Run: pip install sounddevice numpy"})
-            log.error(f"[WakeWord] Missing dep: {e}")
+            self._publish({"event": "unavailable", "message": f"Missing: {e}"})
             return
 
         if self._voice is None:
             self._voice = get_voice_engine()
 
-        RATE = 16000
-        CHUNK = 1280   # 80ms at 16kHz — required by openwakeword
+        RATE  = 16000
+        CHUNK = 1280
 
         log.info("[WakeWord] Listening for 'Hey JARVIS'...")
 
         while not self._stop.is_set():
             try:
-                detector = self._voice._get_wake_word()
-                detected = threading.Event()
-                buf_ready = threading.Event()
+                detector   = self._voice._get_wake_word()
+                buf_ready  = threading.Event()
                 latest_buf = [None]
 
                 def callback(indata, frames, time_info, status):
-                    latest_buf[0] = (indata[:, 0].copy() if indata.ndim > 1 else indata.copy())
+                    latest_buf[0] = (
+                        indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
+                    )
                     buf_ready.set()
 
-                # ── Phase 1: wait for wake word ──────────────────────────
-                with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                                    blocksize=CHUNK, callback=callback):
+                with sd.InputStream(
+                    samplerate=RATE, channels=1, dtype="int16",
+                    blocksize=CHUNK, callback=callback
+                ):
                     while not self._stop.is_set():
                         buf_ready.wait(timeout=1.0)
                         buf_ready.clear()
                         if latest_buf[0] is not None:
                             if detector.detect(latest_buf[0].tobytes()):
-                                log.info("[WakeWord] 'Hey JARVIS' detected!")
+                                log.info("[WakeWord] Detected!")
                                 self._publish({"event": "detected"})
-                                detected.set()
                                 break
 
                 if self._stop.is_set():
                     break
 
-                # ── Phase 2: capture follow-up command via STT ───────────
                 self._publish({"event": "listening"})
-                log.info("[WakeWord] Capturing command...")
-
-                # Give hardware 150ms to release before reopening
                 time.sleep(0.15)
 
-                transcript = self._voice.listen(timeout=6.0, silence_timeout=1.2)
+                # Use tighter silence timeout for wake-word flow
+                transcript = self._voice.listen(timeout=6.0, silence_timeout=0.5)
 
                 if transcript and transcript.strip():
                     log.info(f"[WakeWord] Transcript: {transcript}")
@@ -775,11 +957,14 @@ class WakeWordService:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SINGLETON INSTANCE
+#  SINGLETONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_voice_instance = None
-_voice_lock = threading.Lock()
+_voice_instance    = None
+_voice_lock        = threading.Lock()
+_wake_service      = None
+_wake_service_lock = threading.Lock()
+
 
 def get_voice_engine(tts_engine: str = "pyttsx3") -> VoiceEngine:
     """Get the global VoiceEngine singleton."""
@@ -787,41 +972,35 @@ def get_voice_engine(tts_engine: str = "pyttsx3") -> VoiceEngine:
     if _voice_instance is None:
         with _voice_lock:
             if _voice_instance is None:
-                _voice_instance = VoiceEngine(tts_engine)
+                # Auto-try Piper; fall back to pyttsx3 if not installed
+                try:
+                    import piper  # noqa
+                    tts = "piper"
+                except ImportError:
+                    tts = tts_engine
+                _voice_instance = VoiceEngine(tts)
     return _voice_instance
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BACKWARD-COMPATIBLE INTERFACE (from original voice.py)
-# ═══════════════════════════════════════════════════════════════════════════════
+def get_wake_service() -> WakeWordService:
+    global _wake_service
+    if _wake_service is None:
+        with _wake_service_lock:
+            if _wake_service is None:
+                _wake_service = WakeWordService()
+    return _wake_service
+
+
+# ── Backward-compat helpers ──────────────────────────────────────────────────
 
 def listen() -> str:
-    """Backward-compatible STT function."""
     try:
-        engine = get_voice_engine()
-        return engine.listen()
+        return get_voice_engine().listen()
     except Exception:
         return ""
 
 def speak(text: str) -> None:
-    """Backward-compatible TTS function."""
     try:
-        engine = get_voice_engine()
-        engine.speak_async(text)
+        get_voice_engine().speak_async(text)
     except Exception:
         pass
-
-
-# ── Wake Word Service singleton ──────────────────────────────────────────────
-
-_wake_service_instance = None
-_wake_service_lock = threading.Lock()
-
-def get_wake_service() -> "WakeWordService":
-    """Get the global WakeWordService singleton."""
-    global _wake_service_instance
-    if _wake_service_instance is None:
-        with _wake_service_lock:
-            if _wake_service_instance is None:
-                _wake_service_instance = WakeWordService()
-    return _wake_service_instance

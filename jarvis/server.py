@@ -34,7 +34,7 @@ import time
 import threading
 from brain import (
     think, think_stream, check_nvidia, check_openrouter, check_gemini,
-    set_mode, get_mode, get_session_stats, CURRENT_MODE,
+    check_ollama, set_mode, get_mode, get_session_stats, CURRENT_MODE,
 )
 # ── Production wake word system ──────────────────────────────────────────────
 from wake.service import get_wake_service as _get_production_wake_service
@@ -114,6 +114,7 @@ def health():
             "nvidia_nim": nvidia_ok,
             "openrouter": openrouter_ok,
             "gemini": gemini_ok,
+            "ollama_local": check_ollama(),
         },
         "memory": mem_stats,
         "voice": voice_status,
@@ -460,7 +461,139 @@ def voice_wake_status():
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STARTUP
 # ═══════════════════════════════════════════════════════════════════════════════
-
+REALTIME_ASK_ENDPOINT = '''
+@app.route("/voice/realtime-ask", methods=["POST"])
+def voice_realtime_ask():
+    """
+    Real-time voice pipeline endpoint.
+ 
+    Streams tokens to the frontend via SSE AND simultaneously pipes them
+    into a StreamingSpeaker so JARVIS starts speaking the first sentence
+    before the AI has even finished generating.
+ 
+    Request body (JSON):
+        message  — the user's query (required)
+        tts      — true to enable server-side TTS (default: true)
+ 
+    SSE events (same format as /ask-stream):
+        data: {"char": "..."}          — each token
+        data: {"sentence": "..."}      — each sentence spoken (for UI feedback)
+        data: {"done": true, ...}      — stream complete
+    """
+    data = request.get_json(silent=True)
+    if not data or "message" not in data:
+        return jsonify({"error": "Missing 'message' field"}), 400
+ 
+    user_message = data["message"].strip()
+    if not user_message:
+        return jsonify({"error": "Empty message"}), 400
+ 
+    tts_enabled = data.get("tts", True)
+ 
+    _add_to_history("user", user_message)
+ 
+    def generate():
+        full_response = ""
+        speaker       = None
+ 
+        if tts_enabled:
+            try:
+                from voice import get_voice_engine, StreamingSpeaker
+                engine  = get_voice_engine()
+                speaker = StreamingSpeaker(engine._tts)
+            except Exception as e:
+                log.warning(f"[realtime-ask] TTS unavailable: {e}")
+ 
+        def _on_sentence(sentence: str):
+            """Called by speaker just before each utterance — notify frontend."""
+            pass   # could yield a sentence event here; see below
+ 
+        try:
+            for chunk in think_stream(user_message):
+                if "token" in chunk:
+                    token = chunk["token"]
+                    full_response += token
+ 
+                    # ── 1. Send token to frontend ────────────────────────
+                    yield f"data: {json.dumps({'char': token})}\n\n"
+ 
+                    # ── 2. Feed token to StreamingSpeaker ────────────────
+                    if speaker is not None:
+                        speaker.feed_token(token)
+ 
+                elif "done" in chunk and chunk["done"]:
+                    # Flush any trailing text to TTS
+                    if speaker is not None:
+                        speaker.flush()
+                        # Don't wait_done() here — let audio finish in background
+                        # so the SSE response returns promptly.
+ 
+                    _add_to_history(
+                        "jarvis", full_response,
+                        model=chunk.get("model", ""),
+                        tier=chunk.get("tier", ""),
+                    )
+                    done_payload = json.dumps({
+                        "done":        True,
+                        "action":      "NONE",
+                        "model":       chunk.get("model",    "unknown"),
+                        "tier":        chunk.get("tier",     "unknown"),
+                        "provider":    chunk.get("provider", "unknown"),
+                        "fallback":    chunk.get("fallback",    False),
+                        "memory_used": chunk.get("memory_used", False),
+                        "tts_active":  speaker is not None,
+                    })
+                    yield f"data: {done_payload}\n\n"
+ 
+        except Exception as e:
+            traceback.print_exc()
+            if speaker:
+                try:
+                    speaker.stop()
+                except Exception:
+                    pass
+            yield f"data: {json.dumps({'done': True, 'error': str(e), 'action': 'NONE', 'model': 'none', 'fallback': True})}\n\n"
+ 
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":       "keep-alive",
+        },
+    )
+ 
+ 
+@app.route("/voice/tts-engine", methods=["POST", "GET"])
+def voice_tts_engine():
+    """
+    GET  → return current TTS engine name
+    POST → switch TTS engine at runtime
+           Body: {"engine": "pyttsx3" | "piper" | "coqui"}
+    """
+    try:
+        from voice import get_voice_engine
+        engine = get_voice_engine()
+ 
+        if request.method == "GET":
+            status = engine.get_status()
+            return jsonify({
+                "tts_engine":      status["tts_engine"],
+                "piper_available": status.get("piper_available", False),
+            })
+ 
+        data = request.get_json(silent=True) or {}
+        new_engine = data.get("engine", "pyttsx3")
+        if new_engine not in ("pyttsx3", "piper", "coqui"):
+            return jsonify({"error": f"Unknown engine: {new_engine}"}), 400
+ 
+        engine.switch_tts(new_engine)
+        return jsonify({"success": True, "engine": new_engine})
+ 
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+'''
 if __name__ == "__main__":
     mode_info = get_mode()
 

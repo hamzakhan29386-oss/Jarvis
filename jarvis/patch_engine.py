@@ -1,9 +1,12 @@
 """
 patch_engine.py — Patches wake/engine.py to support sklearn pkl models
-Run from: C:\Users\hamza\Desktop\Jarvis-2\jarvis
-Usage:    python patch_engine.py
-"""
 
+Run from:
+C:/Users/hamza/Desktop/Jarvis-2/jarvis
+
+Usage:
+    python patch_engine.py
+"""
 from pathlib import Path
 
 ENGINE_PATH = Path("wake/engine.py")

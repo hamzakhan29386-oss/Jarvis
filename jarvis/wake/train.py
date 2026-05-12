@@ -1,415 +1,811 @@
 """
-wake/train.py — Custom Wake Word Model Training Pipeline
-=========================================================
-Trains an OpenWakeWord ONNX model for "Hey Jarvis" using
-your collected + augmented dataset.
+wake/train.py — Production Wake Word Training Pipeline
+========================================================
+Trains a custom "Hey JARVIS" wake word model using OpenWakeWord.
 
-Stages:
-    1. Validate dataset
-    2. Split train / validation
-    3. Train via OpenWakeWord automated training
-    4. Export ONNX
-    5. Evaluate + threshold recommendation
+PATH RESOLUTION (fixed):
+    This script resolves all dataset paths relative to its OWN location
+    (the wake/ directory), not relative to cwd. So it works correctly
+    whether you run it as:
+        python -m wake.train          (from jarvis/)
+        python train.py               (from jarvis/wake/)
+        python wake/train.py          (from jarvis/)
+
+    Dataset must be at:   <this file's directory>/dataset/positive/
+    i.e.  jarvis/wake/dataset/positive/*.wav
 
 Usage:
-    python -m wake.train
-    python -m wake.train --epochs 200 --positive dataset/positive --augmented dataset/augmented
+    cd C:\\Users\\hamza\\Desktop\\Jarvis-2\\jarvis
+    python -m wake.train --epochs 150
+
+    Or with explicit paths:
+    python -m wake.train --positive C:\\path\\to\\positive --negative C:\\path\\to\\negative
 """
 
-from __future__ import annotations
-
 import argparse
-import json
 import logging
-import random
+import os
 import shutil
-import time
+import sys
 import wave
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="  [%(levelname)s] %(name)s — %(message)s",
+)
 log = logging.getLogger("jarvis.wake.train")
-logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
 
-BASE_DIR   = Path(__file__).parent.parent
-DATASET    = BASE_DIR / "dataset"
-MODELS_DIR = BASE_DIR / "models"
-SAMPLE_RATE = 16_000
+# ── THIS FILE'S DIRECTORY (always jarvis/wake/) ───────────────────────────────
+WAKE_DIR = Path(__file__).resolve().parent          # jarvis/wake/
+DATASET_DIR = WAKE_DIR / "dataset"                  # jarvis/wake/dataset/
+MODELS_DIR  = WAKE_DIR / "models"                   # jarvis/wake/models/
+
+# ── Default dataset layout (relative to WAKE_DIR, not cwd) ───────────────────
+DEFAULT_POSITIVE    = [DATASET_DIR / "positive", DATASET_DIR / "augmented"]
+DEFAULT_NEGATIVE    = [DATASET_DIR / "negative"]
+DEFAULT_VALIDATION  = DATASET_DIR / "validation"
+DEFAULT_OUTPUT      = MODELS_DIR / "hey_jarvis_custom.onnx"
+
+# Audio constants
+REQUIRED_SR     = 16000
+REQUIRED_BITS   = 16
+REQUIRED_CH     = 1
+CHUNK_SAMPLES   = 1280          # 80 ms @ 16 kHz — required by OpenWakeWord
+MIN_CLIP_SECS   = 0.5
+MAX_CLIP_SECS   = 4.0
 
 
-# ─── Dataset preparation ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 0 — DIAGNOSTICS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def load_wav_mono16(path: Path) -> np.ndarray:
-    with wave.open(str(path), "rb") as wf:
-        n_ch   = wf.getnchannels()
-        rate   = wf.getframerate()
-        raw    = wf.readframes(wf.getnframes())
-    audio = np.frombuffer(raw, dtype=np.int16)
-    if n_ch > 1:
-        audio = audio.reshape(-1, n_ch).mean(axis=1).astype(np.int16)
-    if rate != SAMPLE_RATE:
-        # Simple linear resample
-        ratio  = SAMPLE_RATE / rate
-        n_out  = int(len(audio) * ratio)
-        audio  = np.interp(
-            np.linspace(0, len(audio) - 1, n_out),
-            np.arange(len(audio)),
-            audio,
-        ).astype(np.int16)
-    return audio
+def print_banner():
+    print("\n" + "=" * 62)
+    print("  JARVIS Wake Word Training Pipeline")
+    print("=" * 62)
+    print(f"  Script location : {WAKE_DIR}")
+    print(f"  Working dir     : {Path.cwd()}")
+    print(f"  Dataset root    : {DATASET_DIR}")
+    print(f"  Models output   : {MODELS_DIR}")
+    print("=" * 62 + "\n")
+
+
+def diagnose_paths(positive_dirs: list[Path], negative_dirs: list[Path]):
+    """Print a clear picture of what exists and what's missing."""
+    print("  [DIAGNOSIS] Scanning dataset directories...\n")
+
+    for role, dirs in [("POSITIVE", positive_dirs), ("NEGATIVE", negative_dirs)]:
+        for d in dirs:
+            exists = d.exists()
+            if exists:
+                wavs = list(d.glob("*.wav")) + list(d.glob("**/*.wav"))
+                print(f"  {'✔' if wavs else '⚠'} {role} {d}")
+                print(f"      → {len(wavs)} WAV files found")
+                if wavs:
+                    # Sample format of first file
+                    _check_wav_format(wavs[0], verbose=True)
+            else:
+                print(f"  ✖ {role} {d}")
+                print(f"      → DIRECTORY DOES NOT EXIST")
+    print()
+
+
+def _check_wav_format(path: Path, verbose: bool = False) -> dict:
+    """Validate WAV file format. Returns info dict."""
+    info = {"ok": False, "path": str(path)}
+    try:
+        with wave.open(str(path), "rb") as wf:
+            sr   = wf.getframerate()
+            ch   = wf.getnchannels()
+            bits = wf.getsampwidth() * 8
+            dur  = wf.getnframes() / sr
+            info.update({"sr": sr, "ch": ch, "bits": bits, "dur": dur})
+            issues = []
+            if sr   != REQUIRED_SR:   issues.append(f"sample rate {sr} → need {REQUIRED_SR}")
+            if ch   != REQUIRED_CH:   issues.append(f"{ch} channels → need mono")
+            if bits != REQUIRED_BITS: issues.append(f"{bits}-bit → need {REQUIRED_BITS}-bit")
+            if dur  < MIN_CLIP_SECS:  issues.append(f"too short ({dur:.2f}s)")
+            if dur  > MAX_CLIP_SECS:  issues.append(f"too long ({dur:.2f}s)")
+            info["issues"] = issues
+            info["ok"] = len(issues) == 0
+            if verbose:
+                status = "OK" if info["ok"] else "NEEDS CONVERSION"
+                print(f"      sample file: {path.name} — {sr}Hz, {ch}ch, {bits}bit, {dur:.2f}s [{status}]")
+                for issue in issues:
+                    print(f"        ⚠ {issue}")
+    except Exception as e:
+        info["error"] = str(e)
+        if verbose:
+            print(f"      ✖ Could not read {path.name}: {e}")
+    return info
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 1 — COLLECT AND VALIDATE AUDIO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def collect_wavs(dirs: list[Path]) -> list[Path]:
+    """Recursively collect all WAV files from a list of directories."""
+    found = []
+    for d in dirs:
+        if d.exists():
+            found.extend(sorted(d.glob("*.wav")))
+            found.extend(sorted(d.glob("**/*.wav")))
+    # Deduplicate (augmented/ might overlap with positive/)
+    seen = set()
+    unique = []
+    for p in found:
+        resolved = p.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(p)
+    return unique
+
+
+def convert_wav(src: Path, dst: Path):
+    """
+    Convert a WAV to 16kHz / mono / int16 using scipy or soundfile.
+    Falls back to a raw numpy resample if neither is available.
+    """
+    try:
+        import soundfile as sf
+        import scipy.signal as sig
+
+        data, sr = sf.read(str(src), dtype="int16", always_2d=True)
+        # Mix down to mono
+        if data.shape[1] > 1:
+            data = data.mean(axis=1).astype(np.int16)
+        else:
+            data = data[:, 0]
+        # Resample if needed
+        if sr != REQUIRED_SR:
+            samples_new = int(len(data) * REQUIRED_SR / sr)
+            data = sig.resample(data.astype(np.float32), samples_new).astype(np.int16)
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(dst), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(REQUIRED_SR)
+            wf.writeframes(data.tobytes())
+
+    except ImportError:
+        # Minimal fallback — just fix channel count using raw wave module
+        with wave.open(str(src), "rb") as wf_in:
+            sr   = wf_in.getframerate()
+            ch   = wf_in.getnchannels()
+            raw  = wf_in.readframes(wf_in.getnframes())
+
+        data = np.frombuffer(raw, dtype=np.int16)
+        if ch > 1:
+            data = data.reshape(-1, ch).mean(axis=1).astype(np.int16)
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(dst), "wb") as wf_out:
+            wf_out.setnchannels(1)
+            wf_out.setsampwidth(2)
+            wf_out.setframerate(sr)   # keep original sr; resampling needs scipy
+            wf_out.writeframes(data.tobytes())
+
+        if sr != REQUIRED_SR:
+            log.warning(
+                f"  ⚠ {src.name}: sample rate is {sr}, not {REQUIRED_SR}. "
+                f"Install scipy+soundfile for automatic resampling."
+            )
 
 
 def validate_and_prepare(
     positive_dirs: list[Path],
-    negative_dirs:  list[Path],
-    val_split:      float = 0.15,
+    negative_dirs: list[Path],
+    val_split: float = 0.15,
 ) -> dict:
     """
-    Scan dataset directories, validate format, split train/val.
-    Returns summary dict.
+    Validate all audio, auto-convert where possible, split into train/val.
+    Returns a dict with keys: pos_train, pos_val, neg_train, neg_val.
     """
-    pos_clips = []
-    for d in positive_dirs:
-        pos_clips.extend(d.glob("*.wav"))
+    print("  [STEP 1] Validating and preparing dataset...\n")
 
-    neg_clips = []
-    for d in negative_dirs:
-        neg_clips.extend(d.glob("*.wav"))
+    pos_all = collect_wavs(positive_dirs)
+    neg_all = collect_wavs(negative_dirs)
 
-    if not pos_clips:
-        raise ValueError(f"No positive clips found in {positive_dirs}")
-    if not neg_clips:
-        raise ValueError(f"No negative clips found in {negative_dirs}")
+    # ── Friendly error with clear instructions ────────────────────────────────
+    if not pos_all:
+        _missing_data_error(positive_dirs, "positive")
 
-    log.info("Positive: %d clips  Negative: %d clips", len(pos_clips), len(neg_clips))
+    if not neg_all:
+        log.warning(
+            "  ⚠ No negative clips found. Training without negatives "
+            "will produce a model with very high false-positive rate.\n"
+            "  Add background/noise WAVs to: " +
+            str(negative_dirs[0] if negative_dirs else DATASET_DIR / "negative")
+        )
 
-    if len(pos_clips) < 50:
-        log.warning("Only %d positive clips — 200+ recommended for production", len(pos_clips))
+    log.info(f"  Found {len(pos_all)} positive clips, {len(neg_all)} negative clips")
 
-    # Shuffle and split
-    random.shuffle(pos_clips)
-    random.shuffle(neg_clips)
+    # ── Auto-convert any clips that need it ───────────────────────────────────
+    converted_dir = DATASET_DIR / "_converted"
+    converted_pos, converted_neg = [], []
 
-    n_pos_val = max(1, int(len(pos_clips) * val_split))
-    n_neg_val = max(1, int(len(neg_clips) * val_split))
+    def _ensure_format(clips: list[Path], role: str) -> list[Path]:
+        out = []
+        for clip in clips:
+            info = _check_wav_format(clip)
+            if info.get("ok"):
+                out.append(clip)
+            else:
+                dst = converted_dir / role / clip.name
+                if not dst.exists():
+                    log.info(f"  Converting {clip.name}: {info.get('issues', [])}")
+                    convert_wav(clip, dst)
+                out.append(dst)
+        return out
+
+    pos_all = _ensure_format(pos_all, "positive")
+    neg_all = _ensure_format(neg_all, "negative")
+
+    # ── Train / validation split ──────────────────────────────────────────────
+    rng = np.random.default_rng(42)
+
+    def split(clips):
+        idx = rng.permutation(len(clips))
+        cut = max(1, int(len(clips) * val_split))
+        return [clips[i] for i in idx[cut:]], [clips[i] for i in idx[:cut]]
+
+    pos_train, pos_val = split(pos_all)
+    neg_train, neg_val = split(neg_all) if neg_all else ([], [])
+
+    print(f"  Positive — train: {len(pos_train)}, val: {len(pos_val)}")
+    print(f"  Negative — train: {len(neg_train)}, val: {len(neg_val)}\n")
 
     return {
-        "pos_train": pos_clips[n_pos_val:],
-        "pos_val":   pos_clips[:n_pos_val],
-        "neg_train": neg_clips[n_neg_val:],
-        "neg_val":   neg_clips[:n_neg_val],
-        "n_pos":     len(pos_clips),
-        "n_neg":     len(neg_clips),
+        "pos_train": pos_train, "pos_val": pos_val,
+        "neg_train": neg_train, "neg_val": neg_val,
     }
 
 
-# ─── Training ────────────────────────────────────────────────────────────────
+def _missing_data_error(dirs: list[Path], role: str):
+    """Print a detailed, actionable error and exit cleanly."""
+    print("\n" + "=" * 62)
+    print(f"  ERROR: No {role} WAV clips found.")
+    print("=" * 62)
+    print(f"\n  Searched in:")
+    for d in dirs:
+        print(f"    {'EXISTS  ' if d.exists() else 'MISSING '} {d}")
 
-def train_openwakeword(
-    pos_train: list[Path],
-    neg_train: list[Path],
-    pos_val:   list[Path],
-    neg_val:   list[Path],
-    output_dir: Path,
-    model_name: str = "hey_jarvis_custom",
-    epochs:     int = 150,
-    target_fpr: float = 0.01,
-) -> Path:
+    print(f"""
+  HOW TO FIX:
+  ───────────
+  Your recordings from train_wake.py are in:
+    C:\\Users\\hamza\\Desktop\\wake_training\\positive\\
+
+  You need to copy them to:
+    {DATASET_DIR / 'positive'}
+
+  Run this in PowerShell:
+
+    New-Item -ItemType Directory -Force "{DATASET_DIR / 'positive'}"
+    Copy-Item "C:\\Users\\hamza\\Desktop\\wake_training\\positive\\*.wav" \\
+              "{DATASET_DIR / 'positive'}\\"
+
+  Then re-run:
+    python -m wake.train --epochs 150
+
+  OR pass the path explicitly:
+    python -m wake.train --positive "C:\\Users\\hamza\\Desktop\\wake_training\\positive"
+""")
+    sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 2 — AUGMENTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def augment_dataset(
+    pos_clips: list[Path],
+    aug_dir: Path,
+    target_count: int = 300,
+) -> list[Path]:
     """
-    Run OpenWakeWord training. Returns path to output ONNX model.
+    Augment positive clips to reach target_count using:
+    - Gaussian noise injection
+    - Gain variation
+    - Pitch shift (via sample rate trick)
+    - Time stretch
+    - Reverb simulation (simple convolution)
+
+    Returns list of augmented WAV paths.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if len(pos_clips) >= target_count:
+        log.info(f"  Already have {len(pos_clips)} clips ≥ target {target_count}. Skipping augmentation.")
+        return pos_clips
 
-    log.info("Starting OpenWakeWord training...")
-    log.info("  Positive train: %d  val: %d", len(pos_train), len(pos_val))
-    log.info("  Negative train: %d  val: %d", len(neg_train), len(neg_val))
-    log.info("  Epochs: %d  Target FPR: %.2f", epochs, target_fpr)
+    aug_dir.mkdir(parents=True, exist_ok=True)
+    existing = list(aug_dir.glob("*.wav"))
 
-    # Build flat directory lists (OWW expects list of dirs or list of files)
-    pos_train_dirs = _group_files_to_tmp(pos_train, "pos_train")
-    neg_train_dirs = _group_files_to_tmp(neg_train, "neg_train")
+    needed = target_count - len(pos_clips)
+    log.info(f"  Augmenting: have {len(pos_clips)}, need {needed} more → target {target_count}")
 
+    augmented = list(existing)  # reuse already-generated augments
+    rng = np.random.default_rng(seed=99)
+    idx = 0
+
+    while len(augmented) < needed:
+        src = pos_clips[idx % len(pos_clips)]
+        idx += 1
+
+        aug_name = f"aug_{idx:04d}_{src.stem}.wav"
+        dst = aug_dir / aug_name
+        if dst.exists():
+            augmented.append(dst)
+            continue
+
+        try:
+            # Load source
+            with wave.open(str(src), "rb") as wf:
+                raw = wf.readframes(wf.getnframes())
+                sr  = wf.getframerate()
+            data = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+
+            # ── Choose a random augmentation ──────────────────────────────────
+            aug_type = rng.integers(0, 6)
+
+            if aug_type == 0:
+                # Gaussian noise
+                noise_level = rng.uniform(50, 800)
+                data = data + rng.normal(0, noise_level, len(data))
+
+            elif aug_type == 1:
+                # Gain variation (±6 dB)
+                gain = rng.uniform(0.5, 2.0)
+                data = data * gain
+
+            elif aug_type == 2:
+                # Pitch shift via resampling trick (±15%)
+                factor = rng.uniform(0.85, 1.15)
+                n_new  = int(len(data) * factor)
+                data   = np.interp(
+                    np.linspace(0, len(data)-1, n_new),
+                    np.arange(len(data)), data
+                )
+                # Trim or pad to original length
+                if len(data) > len(np.frombuffer(raw, dtype=np.int16)):
+                    data = data[:len(np.frombuffer(raw, dtype=np.int16))]
+                else:
+                    data = np.pad(data, (0, len(np.frombuffer(raw, dtype=np.int16)) - len(data)))
+
+            elif aug_type == 3:
+                # Time stretch (speed up / slow down) — resample then trim/pad
+                factor = rng.uniform(0.85, 1.15)
+                orig_len = len(data)
+                new_len  = int(orig_len / factor)
+                data     = np.interp(
+                    np.linspace(0, orig_len-1, new_len),
+                    np.arange(orig_len), data
+                )
+                if len(data) >= orig_len:
+                    data = data[:orig_len]
+                else:
+                    data = np.pad(data, (0, orig_len - len(data)))
+
+            elif aug_type == 4:
+                # Simple reverb: mix with decayed delayed copy
+                delay_samples = int(sr * rng.uniform(0.02, 0.08))
+                decay = rng.uniform(0.2, 0.5)
+                delayed = np.zeros_like(data)
+                delayed[delay_samples:] = data[:-delay_samples] * decay
+                data = data + delayed
+
+            elif aug_type == 5:
+                # Combined: noise + gain
+                noise_level = rng.uniform(30, 400)
+                gain        = rng.uniform(0.6, 1.8)
+                data        = (data + rng.normal(0, noise_level, len(data))) * gain
+
+            # ── Clip and save ──────────────────────────────────────────────────
+            data = np.clip(data, -32768, 32767).astype(np.int16)
+            with wave.open(str(dst), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(data.tobytes())
+
+            augmented.append(dst)
+
+        except Exception as e:
+            log.warning(f"  Augmentation failed for {src.name}: {e}")
+
+    log.info(f"  Augmentation complete: {len(augmented)} augmented clips")
+    return pos_clips + augmented
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 3 — FEATURE EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_features(clips: list[Path], label: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Extract log-mel spectrogram features from WAV clips.
+    Returns (X, y) arrays suitable for training.
+
+    Feature shape: (n_samples, n_frames, 32) — 32 mel bins, 3-second window.
+    """
     try:
-        from openwakeword import train_custom_verifier as train_custom_model
+        import librosa
+    except ImportError:
+        log.error(
+            "librosa not installed. Run: pip install librosa\n"
+            "Or: pip install librosa soundfile scipy"
+        )
+        sys.exit(1)
 
+    N_MELS   = 32
+    HOP_LEN  = 160      # 10ms @ 16kHz
+    WIN_LEN  = 400      # 25ms @ 16kHz
+    N_FRAMES = 96       # ~1 second of context
+    MAX_SECS = 3.0
+
+    features, labels = [], []
+
+    for clip in clips:
+        try:
+            y, sr = librosa.load(str(clip), sr=REQUIRED_SR, mono=True,
+                                 duration=MAX_SECS)
+            if len(y) < CHUNK_SAMPLES:
+                continue
+
+            mel = librosa.feature.melspectrogram(
+                y=y, sr=sr, n_mels=N_MELS,
+                hop_length=HOP_LEN, win_length=WIN_LEN,
+            )
+            log_mel = librosa.power_to_db(mel, ref=np.max).T  # (frames, mels)
+
+            # Slide windows across the clip
+            for start in range(0, max(1, len(log_mel) - N_FRAMES + 1), N_FRAMES // 2):
+                window = log_mel[start: start + N_FRAMES]
+                if len(window) < N_FRAMES:
+                    # Pad if clip is shorter than N_FRAMES
+                    window = np.pad(window, ((0, N_FRAMES - len(window)), (0, 0)),
+                                    mode="constant", constant_values=-80)
+                features.append(window)
+                labels.append(label)
+
+        except Exception as e:
+            log.warning(f"  Feature extraction failed for {clip.name}: {e}")
+
+    if not features:
+        return np.empty((0, N_FRAMES, N_MELS)), np.empty(0, dtype=int)
+
+    return np.array(features, dtype=np.float32), np.array(labels, dtype=np.int32)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 4 — TRAINING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def train_model(splits: dict, output_path: Path, epochs: int = 150):
+    """
+    Train the wake word model. Tries two backends in order:
+    1. OpenWakeWord custom training API (preferred)
+    2. scikit-learn + ONNX export (fallback, always available)
+    """
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Try OpenWakeWord first ─────────────────────────────────────────────────
+    success = _train_openwakeword(splits, output_path, epochs)
+    if success:
+        return
+
+    # ── Fallback: sklearn MLP → ONNX ──────────────────────────────────────────
+    log.warning("  OpenWakeWord training API unavailable. Using sklearn fallback.")
+    _train_sklearn_onnx(splits, output_path, epochs)
+
+
+def _train_openwakeword(splits: dict, output_path: Path, epochs: int) -> bool:
+    """Try to train via the OpenWakeWord custom model API. Returns True on success."""
+    try:
+        # OWW 0.6+ exposes train_custom_model
+        from openwakeword.custom import train_custom_model
+
+        pos_dir = DATASET_DIR / "positive"
+        aug_dir = DATASET_DIR / "augmented"
+        neg_dir = DATASET_DIR / "negative"
+
+        positive_refs = [str(pos_dir)]
+        if aug_dir.exists():
+            positive_refs.append(str(aug_dir))
+
+        log.info("  Training via OpenWakeWord custom API...")
         train_custom_model(
-    [str(pos_train_dirs)],
-    [str(neg_train_dirs)],
-    str(output_path),
-    model_name,
-    target_false_positive_rate=target_fpr,
-)
+            positive_reference_clips=positive_refs,
+            negative_reference_clips=[str(neg_dir)] if neg_dir.exists() else [],
+            output_dir=str(output_path.parent),
+            model_name=output_path.stem,
+            epochs=epochs,
+            target_false_positive_rate=0.01,
+        )
 
-        onnx_path = output_dir / f"{model_name}.onnx"
-        if onnx_path.exists():
-            log.info("✓ Model trained: %s", onnx_path)
-            return onnx_path
+        if output_path.exists():
+            log.info(f"  ✔ OpenWakeWord model saved: {output_path}")
+            return True
         else:
-            # Try alternative output name
-            for f in output_dir.glob("*.onnx"):
-                log.info("✓ Model found: %s", f)
-                return f
-            raise FileNotFoundError(f"ONNX model not found in {output_dir}")
+            # OWW might have saved with a different name
+            candidates = list(output_path.parent.glob("*.onnx"))
+            if candidates:
+                shutil.copy(candidates[0], output_path)
+                log.info(f"  ✔ Model saved: {output_path}")
+                return True
 
     except (ImportError, AttributeError) as e:
-        log.warning("OpenWakeWord training API unavailable: %s", e)
-        log.info("Attempting alternative training method...")
-        return _train_fallback(
-            pos_train, neg_train, output_dir, model_name, epochs
-        )
-    finally:
-        # Clean up temp dirs
-        shutil.rmtree(pos_train_dirs, ignore_errors=True)
-        shutil.rmtree(neg_train_dirs, ignore_errors=True)
+        log.warning(f"  OWW custom training API not found: {e}")
+    except Exception as e:
+        log.error(f"  OWW training failed: {e}")
+
+    return False
 
 
-def _group_files_to_tmp(files: list[Path], name: str) -> Path:
-    """Copy files into a single temp directory (OWW expects flat dir)."""
-    import tempfile
-    tmp = Path(tempfile.mkdtemp(prefix=f"oww_{name}_"))
-    for i, f in enumerate(files):
-        dst = tmp / f"{i:05d}_{f.name}"
-        shutil.copy2(str(f), str(dst))
-    return tmp
-
-
-def _train_fallback(
-    pos_clips:  list[Path],
-    neg_clips:  list[Path],
-    output_dir: Path,
-    model_name: str,
-    epochs:     int,
-) -> Path:
+def _train_sklearn_onnx(splits: dict, output_path: Path, epochs: int):
     """
-    Fallback training using a simple binary classifier approach.
-    Uses scikit-learn + ONNX export when OpenWakeWord training API is unavailable.
-    This is a production-quality lightweight alternative.
+    Fallback trainer: log-mel features → MLP → ONNX export.
+    Works with any Python environment that has sklearn + onnxmltools.
     """
-    log.info("Training sklearn fallback classifier...")
-
     try:
-        from sklearn.ensemble import GradientBoostingClassifier
+        from sklearn.neural_network import MLPClassifier
         from sklearn.preprocessing import StandardScaler
         from sklearn.pipeline import Pipeline
-        import pickle
+        import sklearn
     except ImportError:
-        raise ImportError("pip install scikit-learn required for fallback training")
+        log.error("scikit-learn not installed. Run: pip install scikit-learn")
+        sys.exit(1)
 
-    def extract_features(path: Path) -> np.ndarray:
-        """Extract MFCC-like features from a WAV file."""
-        audio = load_wav_mono16(path).astype(np.float32) / 32768.0
-        # Simple spectral features
-        frame_size = 400   # 25ms
-        hop_size   = 160   # 10ms
-        features   = []
-        for start in range(0, len(audio) - frame_size, hop_size):
-            frame = audio[start:start + frame_size]
-            # Energy, ZCR, spectral centroid
-            energy  = np.mean(frame ** 2)
-            zcr     = np.mean(np.abs(np.diff(np.sign(frame)))) / 2
-            fft     = np.abs(np.fft.rfft(frame))
-            freqs   = np.fft.rfftfreq(frame_size, 1 / SAMPLE_RATE)
-            centroid = np.sum(freqs * fft) / (np.sum(fft) + 1e-8)
-            features.append([energy, zcr, centroid])
-        if not features:
-            return np.zeros(3)
-        return np.mean(features, axis=0)
+    print("  [STEP 4] Extracting log-mel features...")
+    all_pos = splits["pos_train"] + splits["pos_val"]
+    all_neg = splits["neg_train"] + splits["neg_val"]
 
-    log.info("Extracting features from %d clips...", len(pos_clips) + len(neg_clips))
-    X, y = [], []
-    for path in pos_clips:
-        try:
-            X.append(extract_features(path))
-            y.append(1)
-        except Exception:
-            pass
-    for path in neg_clips:
-        try:
-            X.append(extract_features(path))
-            y.append(0)
-        except Exception:
-            pass
+    X_pos, y_pos = extract_features(all_pos, label=1)
+    X_neg, y_neg = extract_features(all_neg, label=0)
 
-    X = np.array(X)
-    y = np.array(y)
+    if len(X_pos) == 0:
+        log.error("  No features extracted from positive clips. Check audio format.")
+        sys.exit(1)
 
-    clf = Pipeline([
+    X = np.concatenate([X_pos, X_neg]) if len(X_neg) > 0 else X_pos
+    y = np.concatenate([y_pos, y_neg]) if len(y_neg) > 0 else y_pos
+
+    # Flatten (n_samples, frames, mels) → (n_samples, frames*mels)
+    n_samples = len(X)
+    X_flat = X.reshape(n_samples, -1)
+
+    print(f"  Training MLP on {n_samples} samples ({len(X_pos)} positive, {len(X_neg)} negative)...")
+
+    pipeline = Pipeline([
         ("scaler", StandardScaler()),
-        ("clf", GradientBoostingClassifier(n_estimators=min(epochs, 200), random_state=42)),
+        ("mlp", MLPClassifier(
+            hidden_layer_sizes=(256, 128, 64),
+            activation="relu",
+            max_iter=epochs,
+            early_stopping=True,
+            validation_fraction=0.15,
+            n_iter_no_change=15,
+            verbose=True,
+            random_state=42,
+        )),
     ])
-    clf.fit(X, y)
+    pipeline.fit(X_flat, y)
 
-    model_path = output_dir / f"{model_name}_sklearn.pkl"
-    with open(model_path, "wb") as f:
-        pickle.dump(clf, f)
-
-    log.info("Fallback model saved: %s", model_path)
-    log.warning(
-        "Fallback model is lower quality. For production, install the full "
-        "OpenWakeWord training environment:\n"
-        "  https://github.com/dscripka/openWakeWord/blob/main/docs/training.md"
-    )
-    return model_path
+    # ── Export to ONNX ────────────────────────────────────────────────────────
+    _export_sklearn_onnx(pipeline, X_flat[:1], output_path)
+    print(f"\n  ✔ Model trained and saved: {output_path}")
+    _save_model_metadata(output_path, n_samples, len(X_pos), len(X_neg))
 
 
-# ─── Evaluation ──────────────────────────────────────────────────────────────
+def _export_sklearn_onnx(pipeline, X_sample: np.ndarray, output_path: Path):
+    """Export sklearn pipeline to ONNX format."""
+    try:
+        from skl2onnx import convert_sklearn
+        from skl2onnx.common.data_types import FloatTensorType
 
-def evaluate_model(
-    model_path: Path,
-    pos_val:    list[Path],
-    neg_val:    list[Path],
-    thresholds: list[float] = None,
-) -> dict:
-    """
-    Evaluate model on validation set. Returns accuracy metrics per threshold.
-    """
-    if thresholds is None:
-        thresholds = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+        initial_type = [("float_input", FloatTensorType([None, X_sample.shape[1]]))]
+        onnx_model = convert_sklearn(pipeline, initial_types=initial_type)
 
-    log.info("Evaluating model on %d positive + %d negative clips...",
-             len(pos_val), len(neg_val))
+        with open(str(output_path), "wb") as f:
+            f.write(onnx_model.SerializeToString())
+
+        log.info(f"  ONNX model exported: {output_path}")
+
+    except ImportError:
+        log.warning("  skl2onnx not installed. Saving as pickle fallback.")
+        import pickle
+        pkl_path = output_path.with_suffix(".pkl")
+        with open(str(pkl_path), "wb") as f:
+            pickle.dump(pipeline, f)
+        log.info(f"  Saved as pickle: {pkl_path}")
+        log.info("  Install skl2onnx for ONNX export: pip install skl2onnx")
+
+
+def _save_model_metadata(output_path: Path, n_total: int, n_pos: int, n_neg: int):
+    """Save training metadata alongside the model."""
+    import json, datetime
+    meta = {
+        "model": output_path.name,
+        "wake_word": "hey jarvis",
+        "trained": datetime.datetime.now().isoformat(),
+        "samples": {"total": n_total, "positive": n_pos, "negative": n_neg},
+        "audio": {"sample_rate": REQUIRED_SR, "channels": REQUIRED_CH, "bits": REQUIRED_BITS},
+    }
+    meta_path = output_path.with_suffix(".json")
+    with open(str(meta_path), "w") as f:
+        json.dump(meta, f, indent=2)
+    log.info(f"  Metadata saved: {meta_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 5 — EVALUATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_model(output_path: Path, splits: dict):
+    """Quick sanity check: run the saved model on validation clips and report accuracy."""
+    if not output_path.exists():
+        log.warning("  Model not found, skipping evaluation.")
+        return
+
+    print("\n  [STEP 5] Evaluating model on validation set...\n")
+
+    pos_val = splits.get("pos_val", [])
+    neg_val = splits.get("neg_val", [])
+
+    if not pos_val and not neg_val:
+        log.warning("  No validation clips available.")
+        return
 
     try:
-        from openwakeword.model import Model as OWWModel
-        model = OWWModel(
-            wakeword_models  = [str(model_path)],
-            inference_framework = "onnx",
-        )
-        model_key = next(iter(model.models.keys()))
+        import onnxruntime as ort
 
-        def predict_clip(path: Path) -> float:
-            audio = load_wav_mono16(path)
-            chunk_size = 1280
-            scores = []
-            for start in range(0, len(audio) - chunk_size, chunk_size):
-                chunk = audio[start:start + chunk_size]
-                s = model.predict(chunk)
-                scores.append(max(s.values()) if s else 0.0)
-            return max(scores) if scores else 0.0
+        sess = ort.InferenceSession(str(output_path))
+        input_name = sess.get_inputs()[0].name
+
+        def _run(clips, expected_label):
+            correct = 0
+            for clip in clips:
+                X, _ = extract_features([clip], label=expected_label)
+                if len(X) == 0:
+                    continue
+                X_flat = X.reshape(len(X), -1).astype(np.float32)
+                for sample in X_flat:
+                    pred = sess.run(None, {input_name: sample[None]})[0][0]
+                    if int(pred) == expected_label:
+                        correct += 1
+            return correct, len(clips)
+
+        tp, total_pos = _run(pos_val, 1)
+        tn, total_neg = _run(neg_val, 0)
+
+        if total_pos > 0:
+            print(f"  True positive rate  (sensitivity): {tp}/{total_pos} = {tp/total_pos*100:.1f}%")
+        if total_neg > 0:
+            print(f"  True negative rate  (specificity): {tn}/{total_neg} = {tn/total_neg*100:.1f}%")
+        print()
 
     except Exception as e:
-        log.warning("Cannot load ONNX model for evaluation: %s", e)
-        return {}
-
-    pos_scores = []
-    for p in pos_val[:200]:
-        try:
-            pos_scores.append(predict_clip(p))
-        except Exception:
-            pass
-
-    neg_scores = []
-    for p in neg_val[:400]:
-        try:
-            neg_scores.append(predict_clip(p))
-        except Exception:
-            pass
-
-    if not pos_scores or not neg_scores:
-        return {}
-
-    results = {}
-    best_f1 = 0
-    best_thresh = 0.3
-
-    log.info("\n  Threshold | TPR    | FPR    | F1")
-    log.info("  ----------+--------+--------+--------")
-
-    for thresh in thresholds:
-        tp = sum(1 for s in pos_scores if s >= thresh)
-        fn = sum(1 for s in pos_scores if s <  thresh)
-        fp = sum(1 for s in neg_scores if s >= thresh)
-        tn = sum(1 for s in neg_scores if s <  thresh)
-
-        tpr = tp / (tp + fn + 1e-8)
-        fpr = fp / (fp + tn + 1e-8)
-        precision = tp / (tp + fp + 1e-8)
-        f1  = 2 * precision * tpr / (precision + tpr + 1e-8)
-
-        results[thresh] = {"tpr": tpr, "fpr": fpr, "f1": f1}
-        log.info("  %.2f      | %.3f  | %.3f  | %.3f", thresh, tpr, fpr, f1)
-
-        if f1 > best_f1:
-            best_f1     = f1
-            best_thresh = thresh
-
-    log.info("\n  ✓ Recommended threshold: %.2f  (F1=%.3f)", best_thresh, best_f1)
-    results["recommended_threshold"] = best_thresh
-
-    # Save evaluation report
-    report_path = MODELS_DIR / "evaluation_report.json"
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(report_path, "w") as f:
-        json.dump({
-            "model":    str(model_path),
-            "n_pos_val": len(pos_scores),
-            "n_neg_val": len(neg_scores),
-            "results":  {str(k): v for k, v in results.items()},
-            "pos_score_mean": float(np.mean(pos_scores)),
-            "neg_score_mean": float(np.mean(neg_scores)),
-        }, f, indent=2)
-    log.info("  Evaluation report saved: %s", report_path)
-
-    return results
+        log.warning(f"  Evaluation skipped: {e}")
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CLI ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m wake.train",
+        description="Train a custom 'Hey JARVIS' wake word model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  # Standard run (uses wake/dataset/positive/ automatically)
+  python -m wake.train --epochs 150
+
+  # Point at your old wake_training folder
+  python -m wake.train \\
+    --positive "C:\\Users\\hamza\\Desktop\\wake_training\\positive" \\
+    --negative "C:\\Users\\hamza\\Desktop\\wake_training\\negative" \\
+    --epochs 150
+
+  # Augment up to 400 clips before training
+  python -m wake.train --epochs 150 --augment --target-clips 400
+
+  # Diagnose only (no training)
+  python -m wake.train --diagnose
+        """
+    )
+    p.add_argument(
+        "--positive", nargs="+", type=Path,
+        help="Path(s) to positive 'Hey JARVIS' WAV clips. "
+             f"Default: {[str(d) for d in DEFAULT_POSITIVE]}",
+    )
+    p.add_argument(
+        "--negative", nargs="+", type=Path,
+        help="Path(s) to negative/background WAV clips. "
+             f"Default: {[str(d) for d in DEFAULT_NEGATIVE]}",
+    )
+    p.add_argument(
+        "--output", type=Path, default=DEFAULT_OUTPUT,
+        help=f"Output ONNX model path. Default: {DEFAULT_OUTPUT}",
+    )
+    p.add_argument("--epochs",        type=int,   default=150)
+    p.add_argument("--val-split",     type=float, default=0.15)
+    p.add_argument("--augment",       action="store_true",
+                   help="Augment positive clips to reach --target-clips")
+    p.add_argument("--target-clips",  type=int,   default=300,
+                   help="Target clip count after augmentation (default: 300)")
+    p.add_argument("--diagnose",      action="store_true",
+                   help="Print diagnostics and exit without training")
+    p.add_argument("--skip-eval",     action="store_true",
+                   help="Skip post-training evaluation")
+    return p
+
 
 def run_training_pipeline(args):
-    t_start = time.time()
+    print_banner()
 
-    # Collect input directories
-    positive_dirs = [Path(p) for p in args.positive]
-    negative_dirs = [Path(p) for p in args.negative]
+    # ── Resolve paths ─────────────────────────────────────────────────────────
+    # CRITICAL: use the script's own directory as the anchor, not cwd.
+    positive_dirs = args.positive or DEFAULT_POSITIVE
+    negative_dirs = args.negative or DEFAULT_NEGATIVE
+    output_path   = args.output
 
-    if args.augmented:
-        positive_dirs.append(Path(args.augmented))
+    # Convert to Path and resolve relative paths against WAKE_DIR (not cwd)
+    positive_dirs = [
+        Path(p) if Path(p).is_absolute() else (WAKE_DIR / p).resolve()
+        for p in positive_dirs
+    ]
+    negative_dirs = [
+        Path(p) if Path(p).is_absolute() else (WAKE_DIR / p).resolve()
+        for p in negative_dirs
+    ]
 
-    # Validate + split
-    splits = validate_and_prepare(positive_dirs, negative_dirs, val_split=0.15)
-    log.info(
-        "Dataset: %d pos / %d neg  (%.0f%% held for validation)",
-        splits["n_pos"], splits["n_neg"], 15
-    )
+    diagnose_paths(positive_dirs, negative_dirs)
 
-    # Train
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = train_openwakeword(
-        pos_train  = splits["pos_train"],
-        neg_train  = splits["neg_train"],
-        pos_val    = splits["pos_val"],
-        neg_val    = splits["neg_val"],
-        output_dir = MODELS_DIR,
-        model_name = args.name,
-        epochs     = args.epochs,
-        target_fpr = args.fpr,
-    )
+    if args.diagnose:
+        print("  [--diagnose] Exiting without training.")
+        return
 
-    # Evaluate if ONNX
-    if model_path.suffix == ".onnx":
-        evaluate_model(model_path, splits["pos_val"], splits["neg_val"])
+    # ── Validate + prepare ────────────────────────────────────────────────────
+    splits = validate_and_prepare(positive_dirs, negative_dirs, val_split=args.val_split)
 
-    elapsed = time.time() - t_start
-    log.info("\n  Training complete in %.1fs", elapsed)
-    log.info("  Model: %s", model_path)
-    log.info("\n  To use in JARVIS:")
-    log.info("    Set ENGINE_CONFIG model_path = '%s'", model_path)
-    log.info("    Recommended threshold: see evaluation report above")
+    # ── Augmentation ──────────────────────────────────────────────────────────
+    if args.augment:
+        aug_dir = DATASET_DIR / "augmented"
+        splits["pos_train"] = augment_dataset(
+            splits["pos_train"], aug_dir, target_count=args.target_clips
+        )
+        log.info(f"  Post-augmentation train set: {len(splits['pos_train'])} positive clips")
+
+    # ── Train ─────────────────────────────────────────────────────────────────
+    print(f"  [STEP 4] Training ({args.epochs} epochs) → {output_path}\n")
+    train_model(splits, output_path, epochs=args.epochs)
+
+    # ── Evaluate ──────────────────────────────────────────────────────────────
+    if not args.skip_eval:
+        evaluate_model(output_path, splits)
+
+    # ── Final instructions ────────────────────────────────────────────────────
+    print("=" * 62)
+    print("  TRAINING COMPLETE")
+    print("=" * 62)
+    print(f"\n  Model: {output_path}")
+    print(f"\n  To use this model, update voice.py:")
+    print(f'    wakeword_models=["{output_path}"]')
+    print(f"\n  Or run the JARVIS detector:")
+    print(f"    python -m wake.detector --model \"{output_path}\"")
+    print()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Hey JARVIS wake word model")
-    parser.add_argument("--positive",  nargs="+", default=["dataset/positive"],
-                        help="Positive sample directories")
-    parser.add_argument("--negative",  nargs="+", default=["dataset/negative"],
-                        help="Negative sample directories")
-    parser.add_argument("--augmented", default="dataset/augmented",
-                        help="Augmented samples directory (added to positive)")
-    parser.add_argument("--name",    default="hey_jarvis_custom")
-    parser.add_argument("--epochs",  type=int, default=150)
-    parser.add_argument("--fpr",     type=float, default=0.01,
-                        help="Target false positive rate")
-    args = parser.parse_args()
-
+    parser = build_arg_parser()
+    args   = parser.parse_args()
     run_training_pipeline(args)

@@ -25,7 +25,8 @@ New Endpoints:
     GET  /voice/status        -> Voice engine status
     GET  /session-stats       -> Per-model usage stats
 """
-
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from flask import Flask, request, jsonify, send_from_directory, Response
 import traceback
 import json

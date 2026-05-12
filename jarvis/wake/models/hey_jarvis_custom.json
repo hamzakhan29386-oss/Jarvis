@@ -1,0 +1,15 @@
+{
+  "model": "hey_jarvis_custom.onnx",
+  "wake_word": "hey jarvis",
+  "trained": "2026-05-12T15:13:36.887399",
+  "samples": {
+    "total": 1584,
+    "positive": 1104,
+    "negative": 480
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "bits": 16
+  }
+}

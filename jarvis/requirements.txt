@@ -32,6 +32,7 @@ pywin32; platform_system == "Windows"
 # ── Voice: STT ───────────────────────────────────────────────────────────────
 faster-whisper          # Whisper STT (tiny.en model, ~39MB, int8)
 sounddevice             # microphone input + audio playback
+scipy                   # real-time 48000Hz -> 16000Hz resampling
 soundfile               # audio file I/O
 
 # ── Voice: TTS ───────────────────────────────────────────────────────────────

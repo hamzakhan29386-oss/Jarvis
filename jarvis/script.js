@@ -451,52 +451,11 @@ function escapeHtml(t) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  VOICE TOGGLE
+//  NATIVE VOICE TOGGLE
 // ═══════════════════════════════════════════════════════════════
 
 function toggleVoice() {
-  voiceActive = !voiceActive;
-  voiceBtn.classList.toggle("active", voiceActive);
-  if (voiceActive) {
-    setState("listening");
-    showToast("Voice input active (browser mic)", "success");
-    startBrowserSTT();
-  } else {
-    setState("idle");
-    showToast("Voice input off", "success");
-  }
-}
-
-function startBrowserSTT() {
-  try {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { showToast("Speech recognition not supported in this browser","error"); return; }
-    const recognition = new SR();
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.lang = "en-US";
-
-    recognition.onresult = (e) => {
-      const text = e.results[0][0].transcript;
-      userInput.value = text;
-      voiceActive = false;
-      voiceBtn.classList.remove("active");
-      sendMessage();
-    };
-    recognition.onerror = () => {
-      voiceActive = false;
-      voiceBtn.classList.remove("active");
-      setState("idle");
-    };
-    recognition.onend = () => {
-      if (voiceActive) { setState("idle"); voiceActive = false; voiceBtn.classList.remove("active"); }
-    };
-    recognition.start();
-  } catch (e) {
-    showToast("Voice input error: " + e.message, "error");
-    voiceActive = false;
-    voiceBtn.classList.remove("active");
-  }
+  toggleWakeWord();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -657,9 +616,11 @@ function setWakeButtonState(enabled) {
   const btn = $("wake-toggle-btn");
   if (!btn) return;
   wakeEnabled = enabled;
+  voiceActive = enabled;
   btn.textContent = `WAKE: ${enabled ? "ON" : "OFF"}`;
   btn.style.color = enabled ? "var(--green)" : "";
   btn.style.borderColor = enabled ? "var(--green)" : "";
+  if (voiceBtn) voiceBtn.classList.toggle("active", enabled);
 }
 
 async function toggleWakeWord() {
@@ -671,7 +632,7 @@ async function toggleWakeWord() {
       if (d.error) { showToast("Wake word error: " + d.error, "error"); return; }
 
       setWakeButtonState(true);
-      showToast("Wake word active — say 'Hey JARVIS'", "success");
+      showToast("Native wake word active - say 'Hey JARVIS'", "success");
       connectWakeStream();
     } else {
       // Disable on server

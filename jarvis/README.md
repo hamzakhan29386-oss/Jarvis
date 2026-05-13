@@ -191,5 +191,5 @@ Alongside the core `/ask` and `/ask-stream` endpoints, the updated architecture 
 |---------|-----|
 | "All engines offline" | Ensure Ollama is running (`ollama serve`) or set `OPENROUTER_API_KEY` |
 | Slow first response | Ollama is loading the model into memory. Subsequent requests are instant. |
-| Voice not working | Ensure Chrome is used and mic permissions are granted. Check `voice.py` dependencies. |
+| Voice not working | Check the native Python audio logs, `sounddevice` device selection, and the `/voice/wake-status` endpoint. The browser does not own the microphone. |
 | Missing modules | Run `pip install -r requirements.txt` to grab the new memory and voice requirements. |

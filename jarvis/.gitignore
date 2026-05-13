@@ -7,3 +7,4 @@ build/
 dist/
 *.spec.bak
 *.log
+node_modules/

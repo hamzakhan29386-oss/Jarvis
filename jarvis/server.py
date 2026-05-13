@@ -433,8 +433,13 @@ def voice_status():
     """Return voice engine status."""
     try:
         from voice import get_voice_engine
+        from voice.voice_manager import get_voice_manager
+
         engine = get_voice_engine()
-        return jsonify(engine.get_status())
+        return jsonify({
+            **engine.get_status(),
+            "native_runtime": get_voice_manager().get_status(),
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

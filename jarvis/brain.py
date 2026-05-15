@@ -460,19 +460,31 @@ def _get_live_web_context(prompt: str) -> str:
         return f"Live web search failed: {exc}"
 
 
-def _augment_prompt_with_web_context(prompt: str, web_context: str) -> str:
-    if not web_context:
-        return prompt
-    return (
-        f"{prompt}\n\n"
-        "[LIVE WEB SEARCH CONTEXT]\n"
-        f"{web_context}\n\n"
-        "[JARVIS INSTRUCTION]\n"
-        "Use the live web context above to answer the user's question. "
-        "Prefer the search results over model memory for current facts. "
-        "Mention uncertainty when results conflict, and include source names or URLs "
-        "when useful in a spoken response."
-    )
+def _build_web_override_prompt(search_results: str) -> str:
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    override_prompt = f"""
+You are JARVIS, an advanced autonomous desktop AI. 
+The current exact date and time is: {current_time}.
+
+CRITICAL DIRECTIVE:
+You have been provided with live, real-time internet search results below. 
+You MUST answer the user's prompt using this new information.
+- DO NOT mention your knowledge cutoff date. 
+- DO NOT say your training data stops in 2023.
+- DO NOT apologize. 
+- Act completely confident and integrate these search results seamlessly as your own current knowledge.
+
+REAL-TIME INTERNET DATA:
+{search_results}
+"""
+    return override_prompt.strip()
+
+
+def _select_system_prompt(system_prompt: str, web_context: str) -> str:
+    if web_context:
+        return _build_web_override_prompt(web_context)
+    return system_prompt
 
 
 def think(prompt: str) -> dict:
@@ -547,11 +559,11 @@ def think(prompt: str) -> dict:
     used_model = "none"
     used_tier = tier
     web_context = _get_live_web_context(prompt)
-    model_prompt = _augment_prompt_with_web_context(prompt, web_context)
+    model_system_prompt = _select_system_prompt(system_prompt, web_context)
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": model_prompt},
+        {"role": "system", "content": model_system_prompt},
+        {"role": "user",   "content": prompt},
     ]
 
     for i, model_key in enumerate(chain):
@@ -676,11 +688,11 @@ def think_stream(prompt: str):
     full_response = ""
     first_token_time = None
     web_context = _get_live_web_context(prompt)
-    model_prompt = _augment_prompt_with_web_context(prompt, web_context)
+    model_system_prompt = _select_system_prompt(system_prompt, web_context)
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": model_prompt},
+        {"role": "system", "content": model_system_prompt},
+        {"role": "user",   "content": prompt},
     ]
 
     for i, model_key in enumerate(chain):

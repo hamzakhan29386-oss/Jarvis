@@ -444,11 +444,35 @@ def execute_action(action_name: str, args: dict = None) -> str:
         return f"Unknown action: {action_name}"
 
     try:
+        try:
+            from event_bus import emit
+            emit("task_started", {"action": action_name, "args": args}, source="actions")
+        except Exception:
+            pass
         result = entry["func"](**args)
         log.info(f"[Action] {action_name} → {str(result)[:80]}")
+        try:
+            from world_state import get_world_state
+            from event_bus import emit
+            get_world_state().push_action(
+                {"action": action_name, "args": args, "result": str(result)[:500]},
+                outcome="completed",
+            )
+            emit(
+                "task_completed",
+                {"action": action_name, "args": args, "result": str(result)[:500]},
+                source="actions",
+            )
+        except Exception:
+            pass
         return result if isinstance(result, str) else json.dumps(result)
     except Exception as e:
         log.error(f"[Action] {action_name} failed: {e}")
+        try:
+            from event_bus import emit
+            emit("task_failed", {"action": action_name, "args": args, "error": str(e)}, priority=2, source="actions")
+        except Exception:
+            pass
         return f"Action '{action_name}' failed: {e}"
 
 
@@ -675,6 +699,30 @@ def parse_intent(ai_response: str) -> dict:
         "requires_confirmation": len(actions) > 2,
         "confidence": confidence,
     }
+
+
+@action("analyze_screen", "Capture and analyze the desktop visually")
+def analyze_screen() -> dict:
+    from computer_use import get_computer_use
+    return get_computer_use().analyze_screen()
+
+
+@action("desktop_click", "Click a screen coordinate with visual verification")
+def desktop_click(x: int, y: int) -> dict:
+    from computer_use import get_computer_use
+    return get_computer_use().move_and_click(int(x), int(y), verify=True)
+
+
+@action("browser_operator_open", "Open a URL with the autonomous browser operator")
+def browser_operator_open(url: str) -> dict:
+    from browser_operator import get_browser_operator
+    return get_browser_operator().open_url(url)
+
+
+@action("browser_operator_search", "Search the web through the browser operator")
+def browser_operator_search(query: str) -> dict:
+    from browser_operator import get_browser_operator
+    return get_browser_operator().search(query)
 
 
 def get_available_actions() -> list:

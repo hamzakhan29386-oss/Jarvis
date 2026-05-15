@@ -290,6 +290,46 @@ body[data-state="cooldown"] .hud-core { animation:cooldown-dim 1.5s ease-out for
 .action-step.failed { color:var(--red); }
 .action-step.running { color:var(--amber); }
 
+/* Cognitive OS panel */
+.cognitive-panel {
+  position:fixed; left:16px; top:100px; width:286px;
+  background:var(--bg-card); backdrop-filter:blur(16px);
+  border:1px solid var(--border-subtle); border-radius:8px;
+  padding:12px; z-index:45; opacity:0.82;
+}
+.cognitive-panel__header {
+  display:flex; justify-content:space-between; align-items:center;
+  font-family:'Orbitron',sans-serif; font-size:10px; letter-spacing:2px;
+  color:var(--cyan); padding-bottom:8px; border-bottom:1px solid var(--border-subtle);
+}
+.cognitive-grid {
+  display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px;
+}
+.cognitive-cell {
+  min-height:42px; border:1px solid rgba(0,240,255,0.12);
+  border-radius:6px; padding:7px 8px; background:rgba(0,240,255,0.035);
+}
+.cognitive-label {
+  display:block; font-family:'Orbitron',sans-serif; font-size:8px;
+  letter-spacing:1.4px; color:var(--text-secondary); margin-bottom:4px;
+}
+.cognitive-value {
+  display:block; font-family:'Rajdhani',sans-serif; font-size:14px;
+  color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.cognitive-stream {
+  margin-top:10px; max-height:78px; overflow:hidden;
+  font-family:'Rajdhani',sans-serif; font-size:12px; line-height:1.35;
+  color:var(--text-secondary);
+}
+.cognitive-event {
+  border-top:1px solid rgba(255,255,255,0.04); padding:4px 0;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.bottom-btn.autonomy-active {
+  border-color:var(--amber); color:var(--amber); box-shadow:0 0 8px var(--amber-glow);
+}
+
 /* ═══ CONVERSATION LOG ═══ */
 .conv-log {
   position:fixed; left:16px; bottom:48px; width:320px; max-height:400px;
@@ -382,4 +422,5 @@ body[data-state="cooldown"] .hud-core { animation:cooldown-dim 1.5s ease-out for
   .mode-btn { padding:5px 10px; font-size:8px; }
   .conv-log { width:calc(100vw - 32px); left:16px; }
   .action-panel { width:calc(100vw - 32px); right:16px; }
+  .cognitive-panel { display:none; }
 }

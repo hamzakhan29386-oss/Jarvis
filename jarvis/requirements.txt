@@ -23,6 +23,7 @@ pyautogui
 pyperclip
 plyer
 Pillow
+pytesseract
 pystray
 playwright
 pygetwindow

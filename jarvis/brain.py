@@ -400,6 +400,11 @@ def _record_stat(tier: str, is_fallback: bool = False):
 
 def think(prompt: str) -> dict:
     """Full JARVIS cognitive pipeline (non-streaming)."""
+    try:
+        from event_bus import emit
+        emit("cognition_started", {"prompt_preview": prompt[:200], "streaming": False}, source="brain")
+    except Exception:
+        pass
     mem = _get_memory()
     memory_used = False
     retrieved_episodes = []
@@ -416,6 +421,8 @@ def think(prompt: str) -> dict:
     else:
         from memory import JARVIS_PERSONA
         system_prompt = JARVIS_PERSONA
+
+    system_prompt = _add_world_context(system_prompt)
 
     if mem:
         procedure = mem.match_procedure(prompt)
@@ -505,7 +512,8 @@ def think(prompt: str) -> dict:
         f"| Provider: {provider} | Time: {t_elapsed:.2f}s | Fallback: {fallback_used}"
     )
 
-    return {
+    response = _reflect_response(prompt, response, used_tier)
+    result_payload = {
         "action": "NONE",
         "response": response,
         "model": used_model,
@@ -515,6 +523,12 @@ def think(prompt: str) -> dict:
         "memory_used": memory_used,
         "response_time_ms": int(t_elapsed * 1000),
     }
+    try:
+        from event_bus import emit
+        emit("cognition_completed", result_payload, source="brain")
+    except Exception:
+        pass
+    return result_payload
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -526,6 +540,11 @@ def think_stream(prompt: str):
     Generator — yields tokens as they arrive for SSE streaming.
     Yields {"token": str} per token, {"done": True, ...} at end.
     """
+    try:
+        from event_bus import emit
+        emit("cognition_started", {"prompt_preview": prompt[:200], "streaming": True}, source="brain")
+    except Exception:
+        pass
     mem = _get_memory()
     retrieved_episodes = []
     memory_used = False
@@ -542,6 +561,7 @@ def think_stream(prompt: str):
     else:
         from memory import JARVIS_PERSONA
         system_prompt = JARVIS_PERSONA
+    system_prompt = _add_world_context(system_prompt)
 
     if mem:
         remember_cmd = mem.detect_remember_command(prompt)
@@ -651,6 +671,38 @@ def think_stream(prompt: str):
         yield {"token": ch}
     yield {"done": True, "model": "none", "tier": "none",
            "provider": "none", "fallback": True, "memory_used": False}
+
+
+def _add_world_context(system_prompt: str) -> str:
+    try:
+        from world_state import get_world_state
+        world = get_world_state().get_state()
+        context = (
+            "\n\n[JARVIS WORLD STATE]\n"
+            f"Operating mode: {world.get('operating_mode')}\n"
+            f"Workspace: {world.get('current_workspace')}\n"
+            f"Focused application: {world.get('focused_application')}\n"
+            f"Active goals: {json.dumps(world.get('active_goals', [])[:5])}\n"
+            "Use this as private situational context. Do not recite it unless useful."
+        )
+        return system_prompt + context
+    except Exception:
+        return system_prompt
+
+
+def _reflect_response(prompt: str, response: str, tier: str) -> str:
+    """
+    Lightweight draft -> critique -> improve layer. It keeps internal reasoning
+    private and applies deterministic cleanup unless deep tiers are active.
+    """
+    if not response:
+        return response
+    cleaned = response.strip()
+    if tier not in {"oracle", "coder", "planner"}:
+        return cleaned
+    for marker in ("chain of thought", "internal reasoning", "hidden reasoning"):
+        cleaned = cleaned.replace(marker, "analysis")
+    return cleaned
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

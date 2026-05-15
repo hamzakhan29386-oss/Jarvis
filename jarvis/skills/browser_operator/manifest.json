@@ -1,0 +1,10 @@
+{
+  "name": "browser_operator",
+  "description": "Autonomous browsing, page snapshots, form interaction, and web task execution.",
+  "permissions": ["browser", "network"],
+  "actions": ["browser.open_url", "browser.search", "browser.click", "browser.fill"],
+  "memory_hooks": ["browser_context_updated"],
+  "ui_hooks": ["browser_operator_status"],
+  "dependencies": ["playwright"],
+  "enabled": true
+}

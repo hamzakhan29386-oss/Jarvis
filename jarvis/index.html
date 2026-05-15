@@ -90,6 +90,33 @@
     <div class="action-panel__steps" id="action-steps"></div>
   </div>
 
+  <!-- Cognitive OS telemetry -->
+  <div class="cognitive-panel" id="cognitive-panel">
+    <div class="cognitive-panel__header">
+      <span>COGNITIVE OS</span>
+      <span id="cog-mode">ASSIST</span>
+    </div>
+    <div class="cognitive-grid">
+      <div class="cognitive-cell">
+        <span class="cognitive-label">AUTONOMY</span>
+        <span class="cognitive-value" id="cog-autonomy">PASSIVE</span>
+      </div>
+      <div class="cognitive-cell">
+        <span class="cognitive-label">ATTENTION</span>
+        <span class="cognitive-value" id="cog-attention">STABLE</span>
+      </div>
+      <div class="cognitive-cell">
+        <span class="cognitive-label">GOALS</span>
+        <span class="cognitive-value" id="cog-goals">0 ACTIVE</span>
+      </div>
+      <div class="cognitive-cell">
+        <span class="cognitive-label">OPERATOR</span>
+        <span class="cognitive-value" id="cog-operator">READY</span>
+      </div>
+    </div>
+    <div class="cognitive-stream" id="cog-stream"></div>
+  </div>
+
   <!-- ═══ RESPONSE AREA ═══ -->
   <div class="response-container" id="response-container">
     <div class="response-header">
@@ -143,6 +170,7 @@
     <button class="bottom-btn" id="toggle-stats-btn" title="Session stats">STATS</button>
     <button class="bottom-btn" id="wake-toggle-btn" title="Toggle wake word (Hey JARVIS)">WAKE: OFF</button>
     <button class="bottom-btn" id="tts-toggle-btn" title="Toggle voice output (JARVIS speaks responses)">TTS: OFF</button>
+    <button class="bottom-btn" id="autonomy-toggle-btn" title="Toggle autonomous cognition loop">AUTO-OS: OFF</button>
   </div>
 
   <!-- ═══ TOAST NOTIFICATION ═══ -->

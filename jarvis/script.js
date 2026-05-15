@@ -22,6 +22,9 @@ const actionPanel = $("action-panel"), actionSteps = $("action-steps");
 const actionProgressBar = $("action-progress-bar");
 const waveformCanvas = $("waveform-canvas");
 const sysCpu = $("sys-cpu"), sysRam = $("sys-ram"), sysBattery = $("sys-battery");
+const cogMode = $("cog-mode"), cogAutonomy = $("cog-autonomy"), cogAttention = $("cog-attention");
+const cogGoals = $("cog-goals"), cogOperator = $("cog-operator"), cogStream = $("cog-stream");
+const autonomyToggleBtn = $("autonomy-toggle-btn");
 
 // ── State ──────────────────────────────────────────────────────
 let currentState = "dormant";
@@ -30,13 +33,15 @@ let typingTimer = null;
 let currentMode = "auto";
 let voiceActive = false;
 let audioCtx = null;
+let autonomousEnabled = false;
 let ttsEnabled = false;   // proactive TTS — muted by default, toggled via button
 
 // ── API URLs ───────────────────────────────────────────────────
 const API = { ask:"/ask", stream:"/ask-stream", health:"/health",
   setMode:"/set-mode", getMode:"/get-mode", sysStatus:"/system-status",
   convHistory:"/conversation-history", parseIntent:"/intent/parse",
-  command:"/assistant/command" };
+  command:"/assistant/command", cognitive:"/cognitive/status",
+  autonomyStart:"/autonomous/start", autonomyStop:"/autonomous/stop" };
 
 // ═══════════════════════════════════════════════════════════════
 //  STATE MACHINE
@@ -79,16 +84,64 @@ document.addEventListener("DOMContentLoaded", () => {
   createTickMarks();
   checkHealth();
   fetchMode();
+  pollCognitiveStatus();
   pollSystemStatus();
   userInput.focus();
   setTimeout(() => setState("idle"), 2000);
   setInterval(() => { if (!isProcessing) checkHealth(); }, 30000);  // skip health during generation
   setInterval(() => { if (!isProcessing) pollSystemStatus(); }, 8000);  // slower polls, skip during gen
+  setInterval(() => { if (!isProcessing) pollCognitiveStatus(); }, 5000);
 });
 
 // ═══════════════════════════════════════════════════════════════
 //  HEALTH CHECK
 // ═══════════════════════════════════════════════════════════════
+
+async function pollCognitiveStatus() {
+  if (!cogMode) return;
+  try {
+    const r = await fetch(API.cognitive, {signal:AbortSignal.timeout(4000)});
+    const d = await r.json();
+    const world = d.world || {};
+    const mode = d.operating_mode || {};
+    const attention = d.attention || {};
+    const loop = d.agent_loop || {};
+    const goals = d.goals || world.active_goals || [];
+
+    autonomousEnabled = !!(world.autonomous_mode || loop.running);
+    cogMode.textContent = mode.mode || world.operating_mode || "ASSIST";
+    cogAutonomy.textContent = autonomousEnabled ? "AUTONOMOUS" : "ASSISTED";
+    cogAttention.textContent = attention.focus?.label || "STABLE";
+    cogGoals.textContent = `${goals.length || 0} ACTIVE`;
+    cogOperator.textContent = loop.running ? (loop.paused ? "PAUSED" : "ACTIVE") : "READY";
+
+    if (autonomyToggleBtn) {
+      autonomyToggleBtn.textContent = autonomousEnabled ? "AUTO-OS: ON" : "AUTO-OS: OFF";
+      autonomyToggleBtn.classList.toggle("autonomy-active", autonomousEnabled);
+    }
+
+    if (cogStream && Array.isArray(d.events)) {
+      cogStream.innerHTML = d.events.slice(-4).reverse().map(ev => {
+        const t = new Date((ev.timestamp || 0) * 1000).toLocaleTimeString();
+        return `<div class="cognitive-event">${t} ${ev.name}</div>`;
+      }).join("");
+    }
+  } catch {}
+}
+
+async function toggleAutonomy() {
+  if (!autonomyToggleBtn) return;
+  const wasEnabled = autonomousEnabled;
+  const url = wasEnabled ? API.autonomyStop : API.autonomyStart;
+  try {
+    await fetch(url, {method:"POST"});
+    autonomousEnabled = !wasEnabled;
+    await pollCognitiveStatus();
+    showToast(autonomousEnabled ? "Autonomous OS online" : "Autonomous OS standing down", "success");
+  } catch {
+    showToast("Autonomous control unavailable", "error");
+  }
+}
 
 async function checkHealth() {
   try {
@@ -741,6 +794,7 @@ if ($("toggle-log-btn")) $("toggle-log-btn").addEventListener("click", toggleCon
 if ($("conv-log-close")) $("conv-log-close").addEventListener("click", () => hide(convLog));
 if ($("wake-toggle-btn")) $("wake-toggle-btn").addEventListener("click", toggleWakeWord);
 if ($("tts-toggle-btn")) $("tts-toggle-btn").addEventListener("click", toggleTTS);
+if (autonomyToggleBtn) autonomyToggleBtn.addEventListener("click", toggleAutonomy);
 if ($("toggle-stats-btn")) $("toggle-stats-btn").addEventListener("click", async () => {
   try {
     const r = await fetch("/session-stats");

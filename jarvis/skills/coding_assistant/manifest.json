@@ -1,0 +1,10 @@
+{
+  "name": "coding_assistant",
+  "description": "Project-aware coding, verification, debugging, and implementation workflows.",
+  "permissions": ["filesystem", "terminal"],
+  "actions": ["project.scan", "tests.run", "code.patch"],
+  "memory_hooks": ["active_coding_project", "task_completed"],
+  "ui_hooks": ["workspace_awareness"],
+  "dependencies": [],
+  "enabled": true
+}

@@ -173,8 +173,12 @@ class MemorySystem:
                 },
                 "projects": [],
                 "goals": [],
+                "projects_memory": {},
+                "relationship_graph": {},
             },
             "procedures": [],
+            "working_memory": [],
+            "world_state_memory": [],
         }
 
         # Load existing data from disk
@@ -203,6 +207,10 @@ class MemorySystem:
                             self._data["semantic"][key] = loaded["semantic"][key]
                 if "procedures" in loaded:
                     self._data["procedures"] = loaded["procedures"]
+                if "working_memory" in loaded:
+                    self._data["working_memory"] = loaded["working_memory"]
+                if "world_state_memory" in loaded:
+                    self._data["world_state_memory"] = loaded["world_state_memory"]
                 log.info(f"[Memory] Loaded from {MEMORY_FILE}")
         except (json.JSONDecodeError, IOError) as e:
             log.warning(f"[Memory] Could not load memory file: {e}")
@@ -246,6 +254,7 @@ class MemorySystem:
             # Auto-generate tags if not provided
             if tags is None:
                 tags = self._auto_tag(user_msg)
+            importance = self._score_importance(user_msg, jarvis_response, tags)
 
             episode = {
                 "id": f"ep_{int(time.time() * 1000)}",
@@ -254,6 +263,11 @@ class MemorySystem:
                 "summary": summary[:600],
                 "tags": tags,
                 "embedding": embedding,
+                "importance_score": importance,
+                "recency_score": 1.0,
+                "relevance_score": 0.0,
+                "project_score": self._score_project(user_msg),
+                "behavioral_score": 0.5,
             }
 
             self._data["episodes"].append(episode)
@@ -269,9 +283,103 @@ class MemorySystem:
                 f"[Memory] Stored episode: {summary[:80]}... "
                 f"(total: {len(self._data['episodes'])})"
             )
+            try:
+                from event_bus import emit
+                emit(
+                    "memory_updated",
+                    {"type": "episodic", "importance_score": importance, "tags": tags},
+                    source="memory",
+                )
+            except Exception:
+                pass
 
         except Exception as e:
             log.error(f"[Memory] Failed to store episode: {e}")
+
+    def remember_world_state(self, snapshot: dict, summary: str = ""):
+        item = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "summary": summary or "World state snapshot",
+            "snapshot": snapshot,
+            "importance_score": 0.6,
+        }
+        with self._lock:
+            self._data.setdefault("world_state_memory", []).append(item)
+            self._data["world_state_memory"] = self._data["world_state_memory"][-100:]
+        threading.Thread(target=self._save, daemon=True).start()
+        return item
+
+    def set_working_memory(self, key: str, value, ttl_seconds: int = 3600):
+        item = {"key": key, "value": value, "expires_at": time.time() + ttl_seconds}
+        with self._lock:
+            active = [
+                m for m in self._data.setdefault("working_memory", [])
+                if m.get("key") != key and m.get("expires_at", 0) > time.time()
+            ]
+            active.append(item)
+            self._data["working_memory"] = active[-50:]
+        threading.Thread(target=self._save, daemon=True).start()
+        return item
+
+    def get_working_memory(self, key: str = None):
+        now = time.time()
+        with self._lock:
+            active = [m for m in self._data.setdefault("working_memory", []) if m.get("expires_at", 0) > now]
+            self._data["working_memory"] = active
+            if key is None:
+                return active
+            for item in active:
+                if item.get("key") == key:
+                    return item.get("value")
+        return None
+
+    def search_by_timeframe(self, since_ts: float = None, until_ts: float = None, limit: int = 20):
+        results = []
+        for episode in self._data.get("episodes", []):
+            try:
+                ts = datetime.fromisoformat(episode["timestamp"]).timestamp()
+            except Exception:
+                continue
+            if since_ts and ts < since_ts:
+                continue
+            if until_ts and ts > until_ts:
+                continue
+            results.append(episode)
+        return results[-limit:]
+
+    def search_by_project(self, project: str, limit: int = 20):
+        project = project.lower()
+        return [
+            episode for episode in self._data.get("episodes", [])
+            if project in json.dumps(episode, ensure_ascii=False).lower()
+        ][-limit:]
+
+    def summarize_recent(self, limit: int = 25) -> str:
+        episodes = self._data.get("episodes", [])[-limit:]
+        if not episodes:
+            return "No recent memory."
+        themes = [episode.get("user_msg", "")[:120] for episode in episodes if episode.get("user_msg")]
+        return "Recent context: " + " | ".join(themes[-8:])
+
+    def _score_importance(self, user_msg: str, jarvis_response: str, tags: list) -> float:
+        text = f"{user_msg} {jarvis_response}".lower()
+        score = 0.35
+        if tags:
+            score += 0.1
+        if any(word in text for word in ("remember", "important", "goal", "project", "deadline", "fix", "error")):
+            score += 0.35
+        if len(text) > 800:
+            score += 0.15
+        return round(min(1.0, score), 3)
+
+    def _score_project(self, user_msg: str) -> float:
+        projects = self._data.get("semantic", {}).get("projects", [])
+        haystack = user_msg.lower()
+        if any(str(project).lower() in haystack for project in projects):
+            return 1.0
+        if any(word in haystack for word in ("repo", "project", "codebase", "workspace")):
+            return 0.7
+        return 0.3
 
     def retrieve(self, query: str, top_k: int = 3) -> list:
         """

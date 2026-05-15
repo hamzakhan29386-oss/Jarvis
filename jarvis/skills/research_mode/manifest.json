@@ -1,0 +1,10 @@
+{
+  "name": "research_mode",
+  "description": "Persistent research sessions with source tracking and knowledge-base indexing.",
+  "permissions": ["browser", "knowledge_base"],
+  "actions": ["research.search", "knowledge.index", "knowledge.retrieve"],
+  "memory_hooks": ["knowledge_indexed"],
+  "ui_hooks": ["reasoning_status"],
+  "dependencies": [],
+  "enabled": true
+}

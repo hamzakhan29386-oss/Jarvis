@@ -42,6 +42,20 @@ from wake.service import get_wake_service as _get_production_wake_service
 WEB_ROOT = resource_path(".")
 app = Flask(__name__, static_folder=str(WEB_ROOT), static_url_path="")
 
+try:
+    from event_bus import emit, get_event_bus
+    from world_state import get_world_state
+    from attention_manager import get_attention_manager
+    from agent_loop import get_agent_loop, AgentJob
+    from operating_modes import get_operating_mode, set_operating_mode
+    from goal_planner import get_goal_planner
+    from tool_registry import get_tool_registry
+    from skills.skill_manager import get_skill_manager
+    from self_optimizer import get_self_optimizer
+    from execution_replay import get_execution_replay
+except Exception:
+    emit = None
+
 # ── CORS support ────────────────────────────────────────────────────────────
 @app.after_request
 def add_cors_headers(response):
@@ -68,6 +82,15 @@ def _add_to_history(role: str, text: str, model: str = "", tier: str = ""):
         })
         if len(_conversation_history) > MAX_HISTORY:
             _conversation_history.pop(0)
+    try:
+        if emit:
+            emit(
+                "conversation_updated",
+                {"role": role, "text": text[:500], "model": model, "tier": tier},
+                source="server",
+            )
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -108,6 +131,17 @@ def health():
     except Exception:
         voice_status = {"error": "voice unavailable"}
 
+    cognitive_status = {}
+    try:
+        cognitive_status = {
+            "world": get_world_state().get_state(),
+            "attention": get_attention_manager().status(),
+            "agent_loop": get_agent_loop().status(),
+            "operating_mode": get_operating_mode(),
+        }
+    except Exception as e:
+        cognitive_status = {"error": str(e)}
+
     return jsonify({
         "status": status,
         "mode": mode_info["mode"],
@@ -121,6 +155,7 @@ def health():
         "memory": mem_stats,
         "voice": voice_status,
         "session_stats": get_session_stats(),
+        "cognitive": cognitive_status,
     })
 
 
@@ -136,6 +171,8 @@ def ask():
         return jsonify({"error": "Empty message"}), 400
 
     try:
+        if emit:
+            emit("user_prompt_received", {"message": user_message[:500]}, source="server")
         _add_to_history("user", user_message)
         result = think(user_message)
         _add_to_history(
@@ -170,6 +207,11 @@ def ask_stream():
         return jsonify({"error": "Empty message"}), 400
 
     _add_to_history("user", user_message)
+    try:
+        if emit:
+            emit("user_prompt_received", {"message": user_message[:500], "streaming": True}, source="server")
+    except Exception:
+        pass
 
     def generate():
         full_response = ""
@@ -511,6 +553,114 @@ def voice_wake_status():
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STARTUP
 # ═══════════════════════════════════════════════════════════════════════════════
+@app.route("/cognitive/status")
+def cognitive_status_endpoint():
+    try:
+        return jsonify({
+            "world": get_world_state().get_state(),
+            "attention": get_attention_manager().status(),
+            "agent_loop": get_agent_loop().status(),
+            "operating_mode": get_operating_mode(),
+            "events": get_event_bus().history(50),
+            "goals": get_goal_planner().list_goals(),
+            "optimizer": get_self_optimizer().recommend_tools(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/world-state", methods=["GET", "POST"])
+def world_state_endpoint():
+    try:
+        ws = get_world_state()
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            return jsonify(ws.update_state(data.get("updates", data), source="api"))
+        return jsonify(ws.get_state())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/goals", methods=["GET", "POST", "DELETE"])
+def goals_endpoint():
+    try:
+        planner = get_goal_planner()
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            goal = planner.create_goal(
+                data.get("title", "Untitled mission"),
+                data.get("subtasks", []),
+                int(data.get("priority", 5)),
+            )
+            get_world_state().set_goal({"id": goal.id, "title": goal.title, "priority": goal.priority})
+            return jsonify(planner.goal_to_dict(goal))
+        if request.method == "DELETE":
+            goal_id = (request.get_json(silent=True) or {}).get("id", "")
+            return jsonify({"cleared": get_world_state().clear_goal(goal_id)})
+        return jsonify(planner.list_goals())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/operating-mode", methods=["GET", "POST"])
+def operating_mode_endpoint():
+    try:
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            return jsonify(set_operating_mode(data.get("mode", "ASSIST")))
+        return jsonify(get_operating_mode())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/autonomous/start", methods=["POST"])
+def autonomous_start():
+    return jsonify(get_agent_loop().start())
+
+
+@app.route("/autonomous/pause", methods=["POST"])
+def autonomous_pause():
+    return jsonify(get_agent_loop().pause())
+
+
+@app.route("/autonomous/resume", methods=["POST"])
+def autonomous_resume():
+    return jsonify(get_agent_loop().resume())
+
+
+@app.route("/autonomous/stop", methods=["POST"])
+def autonomous_stop():
+    return jsonify(get_agent_loop().stop())
+
+
+@app.route("/autonomous/enqueue", methods=["POST"])
+def autonomous_enqueue():
+    data = request.get_json(silent=True) or {}
+    job = AgentJob(kind=data.get("kind", "tool"), payload=data.get("payload", {}), priority=int(data.get("priority", 5)))
+    get_agent_loop().enqueue(job)
+    return jsonify({"queued": True, "job": job.__dict__})
+
+
+@app.route("/tools")
+def tools_endpoint():
+    return jsonify(get_tool_registry().list_tools())
+
+
+@app.route("/skills")
+def skills_endpoint():
+    return jsonify(get_skill_manager().list_skills())
+
+
+@app.route("/events")
+def events_endpoint():
+    return jsonify(get_event_bus().history(int(request.args.get("limit", 100))))
+
+
+@app.route("/execution-replay")
+def execution_replay_endpoint():
+    return jsonify(get_execution_replay().recent(int(request.args.get("limit", 50))))
+
+
 REALTIME_ASK_ENDPOINT = '''
 @app.route("/voice/realtime-ask", methods=["POST"])
 def voice_realtime_ask():
@@ -615,6 +765,114 @@ def voice_realtime_ask():
     )
  
  
+@app.route("/cognitive/status")
+def cognitive_status_endpoint():
+    try:
+        return jsonify({
+            "world": get_world_state().get_state(),
+            "attention": get_attention_manager().status(),
+            "agent_loop": get_agent_loop().status(),
+            "operating_mode": get_operating_mode(),
+            "events": get_event_bus().history(50),
+            "goals": get_goal_planner().list_goals(),
+            "optimizer": get_self_optimizer().recommend_tools(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/world-state", methods=["GET", "POST"])
+def world_state_endpoint():
+    try:
+        ws = get_world_state()
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            return jsonify(ws.update_state(data.get("updates", data), source="api"))
+        return jsonify(ws.get_state())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/goals", methods=["GET", "POST", "DELETE"])
+def goals_endpoint():
+    try:
+        planner = get_goal_planner()
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            goal = planner.create_goal(
+                data.get("title", "Untitled mission"),
+                data.get("subtasks", []),
+                int(data.get("priority", 5)),
+            )
+            get_world_state().set_goal({"id": goal.id, "title": goal.title, "priority": goal.priority})
+            return jsonify(planner.goal_to_dict(goal))
+        if request.method == "DELETE":
+            goal_id = (request.get_json(silent=True) or {}).get("id", "")
+            return jsonify({"cleared": get_world_state().clear_goal(goal_id)})
+        return jsonify(planner.list_goals())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/operating-mode", methods=["GET", "POST"])
+def operating_mode_endpoint():
+    try:
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            return jsonify(set_operating_mode(data.get("mode", "ASSIST")))
+        return jsonify(get_operating_mode())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/autonomous/start", methods=["POST"])
+def autonomous_start():
+    return jsonify(get_agent_loop().start())
+
+
+@app.route("/autonomous/pause", methods=["POST"])
+def autonomous_pause():
+    return jsonify(get_agent_loop().pause())
+
+
+@app.route("/autonomous/resume", methods=["POST"])
+def autonomous_resume():
+    return jsonify(get_agent_loop().resume())
+
+
+@app.route("/autonomous/stop", methods=["POST"])
+def autonomous_stop():
+    return jsonify(get_agent_loop().stop())
+
+
+@app.route("/autonomous/enqueue", methods=["POST"])
+def autonomous_enqueue():
+    data = request.get_json(silent=True) or {}
+    job = AgentJob(kind=data.get("kind", "tool"), payload=data.get("payload", {}), priority=int(data.get("priority", 5)))
+    get_agent_loop().enqueue(job)
+    return jsonify({"queued": True, "job": job.__dict__})
+
+
+@app.route("/tools")
+def tools_endpoint():
+    return jsonify(get_tool_registry().list_tools())
+
+
+@app.route("/skills")
+def skills_endpoint():
+    return jsonify(get_skill_manager().list_skills())
+
+
+@app.route("/events")
+def events_endpoint():
+    return jsonify(get_event_bus().history(int(request.args.get("limit", 100))))
+
+
+@app.route("/execution-replay")
+def execution_replay_endpoint():
+    return jsonify(get_execution_replay().recent(int(request.args.get("limit", 50))))
+
+
 @app.route("/voice/tts-engine", methods=["POST", "GET"])
 def voice_tts_engine():
     """

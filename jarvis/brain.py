@@ -22,6 +22,9 @@ import json
 import logging
 import time
 import threading
+import asyncio
+import datetime
+import re
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -394,6 +397,84 @@ def _record_stat(tier: str, is_fallback: bool = False):
 #  MAIN THINK (non-streaming)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_LIVE_WEB_KEYWORDS = [
+    "today", "today's", "latest", "current", "currently", "recent",
+    "breaking", "news", "headline", "headlines", "this week", "this month",
+    "right now", "live", "update", "updates", "post-2023", "after 2023",
+    "2024", "2025", "2026",
+]
+_LIVE_WEB_QUESTION_RE = re.compile(
+    r"\b(what happened|what is happening|who won|who is winning|"
+    r"latest on|news about|current status|recent developments)\b",
+    re.I,
+)
+_YEAR_RE = re.compile(r"\b20(2[4-9]|[3-9]\d)\b")
+
+
+def needs_live_web_context(prompt: str) -> bool:
+    """Return True when the query likely depends on post-cutoff facts."""
+    q = (prompt or "").lower()
+    if not q:
+        return False
+    if _YEAR_RE.search(q) or _LIVE_WEB_QUESTION_RE.search(q):
+        return True
+    return any(keyword in q for keyword in _LIVE_WEB_KEYWORDS)
+
+
+def _run_coroutine_sync(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result_box = {"value": None, "error": None}
+
+    def _runner():
+        try:
+            result_box["value"] = asyncio.run(coro)
+        except Exception as exc:
+            result_box["error"] = exc
+
+    worker = threading.Thread(target=_runner, daemon=True)
+    worker.start()
+    worker.join()
+    if result_box["error"]:
+        raise result_box["error"]
+    return result_box["value"]
+
+
+def _get_live_web_context(prompt: str) -> str:
+    if not needs_live_web_context(prompt):
+        return ""
+    try:
+        from skills.web_search import search_web
+
+        context = _run_coroutine_sync(search_web(prompt, max_results=5))
+        if context and not context.lower().startswith(("live web search failed", "no live web results")):
+            log.info("[JARVIS WEB] Live search context attached")
+        else:
+            log.info("[JARVIS WEB] Search completed without usable results")
+        return context or ""
+    except Exception as exc:
+        log.warning(f"[JARVIS WEB] Live search unavailable: {exc}")
+        return f"Live web search failed: {exc}"
+
+
+def _augment_prompt_with_web_context(prompt: str, web_context: str) -> str:
+    if not web_context:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        "[LIVE WEB SEARCH CONTEXT]\n"
+        f"{web_context}\n\n"
+        "[JARVIS INSTRUCTION]\n"
+        "Use the live web context above to answer the user's question. "
+        "Prefer the search results over model memory for current facts. "
+        "Mention uncertainty when results conflict, and include source names or URLs "
+        "when useful in a spoken response."
+    )
+
+
 def think(prompt: str) -> dict:
     """Full JARVIS cognitive pipeline (non-streaming)."""
     try:
@@ -465,10 +546,12 @@ def think(prompt: str) -> dict:
     response = None
     used_model = "none"
     used_tier = tier
+    web_context = _get_live_web_context(prompt)
+    model_prompt = _augment_prompt_with_web_context(prompt, web_context)
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": prompt},
+        {"role": "user",   "content": model_prompt},
     ]
 
     for i, model_key in enumerate(chain):
@@ -517,6 +600,7 @@ def think(prompt: str) -> dict:
         "tier": used_tier,
         "provider": provider,
         "memory_used": memory_used,
+        "web_search_used": bool(web_context),
         "response_time_ms": int(t_elapsed * 1000),
     }
     try:
@@ -591,10 +675,12 @@ def think_stream(prompt: str):
     fallback_used = False
     full_response = ""
     first_token_time = None
+    web_context = _get_live_web_context(prompt)
+    model_prompt = _augment_prompt_with_web_context(prompt, web_context)
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": prompt},
+        {"role": "user",   "content": model_prompt},
     ]
 
     for i, model_key in enumerate(chain):
@@ -648,6 +734,7 @@ def think_stream(prompt: str):
                     "provider": provider,
                     "fallback": fallback_used,
                     "memory_used": memory_used,
+                    "web_search_used": bool(web_context),
                     "response_time_ms": int(t_elapsed * 1000),
                 }
                 return
@@ -670,10 +757,17 @@ def think_stream(prompt: str):
 
 
 def _add_world_context(system_prompt: str) -> str:
+    current_dt = datetime.datetime.now().astimezone()
+    time_context = (
+        "\n\n[JARVIS CURRENT TIME]\n"
+        f"Current local date and time: {current_dt.strftime('%A, %B %d, %Y %I:%M:%S %p %Z%z')}\n"
+        "Use this to interpret relative dates like today, yesterday, tomorrow, recent, and latest."
+    )
     try:
         from world_state import get_world_state
         world = get_world_state().get_state()
         context = (
+            time_context +
             "\n\n[JARVIS WORLD STATE]\n"
             f"Operating mode: {world.get('operating_mode')}\n"
             f"Workspace: {world.get('current_workspace')}\n"
@@ -683,7 +777,7 @@ def _add_world_context(system_prompt: str) -> str:
         )
         return system_prompt + context
     except Exception:
-        return system_prompt
+        return system_prompt + time_context
 
 
 def _reflect_response(prompt: str, response: str, tier: str) -> str:

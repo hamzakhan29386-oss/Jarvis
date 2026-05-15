@@ -59,3 +59,4 @@ chromadb                # local persistent vector database for Phase 1 memory
 # ── Utilities ────────────────────────────────────────────────────────────────
 python-dotenv
 pyinstaller
+duckduckgo-search==6.3.7  # AsyncDDGS-powered live web search

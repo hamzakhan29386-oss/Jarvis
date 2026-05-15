@@ -37,6 +37,13 @@ _OPEN_SITE = re.compile(r"^(?:go to|open website|open site|visit)\s+(?P<url>.+)$
 _TYPE_TEXT = re.compile(r"^(?:type|write)\s+(?P<text>.+)$", re.I)
 _VOLUME = re.compile(r"^(?:set\s+)?volume\s+(?P<level>\d{1,3})(?:\s*%)?$", re.I)
 _BRIGHTNESS = re.compile(r"^(?:set\s+)?brightness\s+(?P<level>\d{1,3})(?:\s*%)?$", re.I)
+_LIVE_WEB_HINTS = (
+    "today", "today's", "latest", "current", "currently", "recent",
+    "breaking", "news", "headline", "headlines", "this week", "this month",
+    "right now", "live", "update", "updates", "post-2023", "after 2023",
+    "2024", "2025", "2026",
+)
+_FUTURE_YEAR = re.compile(r"\b20(2[4-9]|[3-9]\d)\b")
 
 _WORKFLOWS = {
     "coding setup": "coding_setup",
@@ -45,6 +52,11 @@ _WORKFLOWS = {
     "focus mode": "study_mode",
     "entertainment mode": "entertainment_mode",
 }
+
+
+def _looks_like_live_web_query(text: str) -> bool:
+    lower = (text or "").lower()
+    return _FUTURE_YEAR.search(lower) is not None or any(hint in lower for hint in _LIVE_WEB_HINTS)
 
 
 def parse_user_intent(text: str) -> ParsedIntent:
@@ -91,8 +103,14 @@ def parse_user_intent(text: str) -> ParsedIntent:
     match = _SEARCH_WEB.match(cleaned)
     if match and "youtube" not in lower:
         query = match.group("query")
-        if lower.startswith("search ") and "news" in query.lower():
-            return ParsedIntent("youtube_search", {"query": query}, 0.75, cleaned)
+        if _looks_like_live_web_query(query):
+            return ParsedIntent(
+                "chat",
+                {"message": cleaned, "web_search": True, "query": query},
+                0.82,
+                cleaned,
+                needs_ai=True,
+            )
         return ParsedIntent("browser_google_search", {"query": query}, 0.85, cleaned)
 
     match = _APP_OPEN.match(cleaned)

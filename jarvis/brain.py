@@ -52,38 +52,38 @@ MODELS = {
     },
 
     "analyst": {
-        "provider": "nvidia",
-        "model": "meta/llama-3.1-70b-instruct",
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash:free",
         "max_tokens": 2048,
-        "temperature": 0.5,
+        "temperature": 0.2,
     },
 
     "coder": {
         "provider": "openrouter",
-        "model": "deepseek/deepseek-chat-v3-0324:free",
+        "model": "deepseek/deepseek-v4-flash:free",
         "max_tokens": 2048,
         "temperature": 0.2,
     },
 
     "oracle": {
-        "provider": "nvidia",
-        "model": "deepseek-ai/deepseek-r1",
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash:free",
         "max_tokens": 4096,
-        "temperature": 0.4,
+        "temperature": 0.2,
     },
 
     "backup": {
         "provider": "openrouter",
-        "model": "deepseek/deepseek-chat-v3-0324:free",
+        "model": "deepseek/deepseek-v4-flash:free",
         "max_tokens": 512,
         "temperature": 0.5,
     },
 
     "backup2": {
-        "provider": "openrouter",
-        "model": "google/gemma-2-9b-it:free",
+        "provider": "nvidia",
+        "model": "meta/llama-3.3-70b-instruct",
         "max_tokens": 512,
-        "temperature": 0.5,
+        "temperature": 0.2,
     },
 
     "local_backup": {
@@ -100,14 +100,12 @@ FALLBACK_CHAINS = {
         "reflex",
         "backup",
         "backup2",
-        "local_backup",
     ],
 
     "analyst": [
         "analyst",
         "backup",
         "backup2",
-        "local_backup",
     ],
 
     "coder": [
@@ -115,14 +113,12 @@ FALLBACK_CHAINS = {
         "oracle",
         "backup",
         "backup2",
-        "local_backup",
     ],
 
     "oracle": [
         "oracle",
         "analyst",
         "backup",
-        "local_backup",
     ],
 }
 CURRENT_MODE = "auto"

@@ -51,6 +51,7 @@ torch                   # needed for silero-vad (CPU only is fine)
 
 # ── NLP / Embeddings ─────────────────────────────────────────────────────────
 sentence-transformers   # memory system embeddings
+chromadb                # local persistent vector database for Phase 1 memory
 
 # ── Coqui TTS (optional — larger natural voice, ~1.5GB) ─────────────────────
 # TTS                   # uncomment if you want Coqui as TTS option

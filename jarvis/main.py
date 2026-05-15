@@ -1,96 +1,65 @@
 """
-main.py — JARVIS Entry Point
-==============================
-Fast, local AI assistant powered by Ollama.
+Async JARVIS entry point.
 
 Run with:
     python main.py
 
-Requirements:
-    pip install requests
-    Ollama must be running: ollama serve
+The console is intentionally thin: user input becomes a user.command event,
+the cognition engine handles routing/memory, and subscribers receive results.
 """
 
-import sys
-from brain import check_ollama, stream_response
+from __future__ import annotations
 
-# ── Banner ──────────────────────────────────────────────────────────────────
-BANNER = r"""
-╔══════════════════════════════════════════════════════════╗
-║                                                          ║
-║          ██╗ █████╗ ██████╗ ██╗   ██╗██╗███████╗         ║
-║          ██║██╔══██╗██╔══██╗██║   ██║██║██╔════╝         ║
-║          ██║███████║██████╔╝██║   ██║██║███████╗         ║
-║     ██   ██║██╔══██║██╔══██╗╚██╗ ██╔╝██║╚════██║         ║
-║     ╚█████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║███████║         ║
-║      ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝         ║
-║                                                          ║
-║        Your Local AI Assistant  ·  Powered by Ollama     ║
-║                  Model: phi3  ·  Fast Mode                ║
-║                                                          ║
-╚══════════════════════════════════════════════════════════╝
-"""
+import asyncio
 
-# Words that trigger exit
+from core.async_runtime import AsyncJarvisRuntime
+
+
 EXIT_WORDS = {"exit", "quit", "bye", "goodbye", "stop", "shutdown", "shut down"}
 
 
-def main():
-    """Main JARVIS loop: Ask → Stream → Repeat."""
+async def _read_line(prompt: str) -> str:
+    return await asyncio.to_thread(input, prompt)
 
-    print(BANNER)
 
-    # ── Check Ollama is running ─────────────────────────────────────────
-    print("  ⏳  Checking Ollama connection...")
-    if check_ollama():
-        print("  🟢  Ollama is running. JARVIS is ready!\n")
-    else:
-        print("  ❌  Cannot reach Ollama at localhost:11434")
-        print("  💡  Start it with:  ollama serve")
-        print("  💡  Then pull the model:  ollama pull phi3")
-        print("  💡  Then run this script again.\n")
-        print("  Continuing anyway (will retry on each message)...\n")
+async def main() -> None:
+    runtime = AsyncJarvisRuntime()
+    completed = asyncio.Event()
 
-    print("  💡  Type your message and press Enter.")
-    print("  💡  Type 'exit' to quit.\n")
-    print("  " + "═" * 56 + "\n")
+    async def print_response(event):
+        response = event.payload.get("response", "")
+        if response:
+            print(f"\nJARVIS > {response}\n")
+        completed.set()
 
-    # ── Main loop ───────────────────────────────────────────────────────
-    while True:
-        try:
-            # Get user input
-            try:
-                user_input = input("  You ➤  ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n\n  👋  Goodbye!")
-                break
+    async def print_error(event):
+        print(f"\nJARVIS error > {event.payload.get('error', 'unknown error')}\n")
+        completed.set()
 
-            # Skip empty input
-            if not user_input:
+    try:
+        await runtime.start()
+    except RuntimeError as exc:
+        print(str(exc))
+        print("Install vector memory dependencies with: pip install chromadb")
+        return
+
+    await runtime.bus.subscribe("cognition.completed", print_response)
+    await runtime.bus.subscribe("cognition.error", print_error)
+
+    print("JARVIS async runtime online. Type 'exit' to quit.")
+    try:
+        while True:
+            text = (await _read_line("You > ")).strip()
+            if not text:
                 continue
-
-            # Check for exit
-            if user_input.lower() in EXIT_WORDS:
-                print("\n  🤖  JARVIS ➤  Goodbye! Shutting down.\n")
+            if text.lower() in EXIT_WORDS:
                 break
-
-            # Stream AI response
-            sys.stdout.write("\n  🤖  JARVIS ➤  ")
-            sys.stdout.flush()
-
-            response = stream_response(user_input)
-
-            # Separator
-            print("\n  " + "─" * 56 + "\n")
-
-        except KeyboardInterrupt:
-            print("\n\n  👋  Interrupted. Shutting down JARVIS...")
-            break
-        except Exception as e:
-            print(f"\n  ❌  Error: {e}")
-            print("  🔄  Recovering...\n")
-            continue
+            completed.clear()
+            await runtime.submit_user_command(text)
+            await completed.wait()
+    finally:
+        await runtime.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

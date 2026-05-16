@@ -67,10 +67,17 @@ class DetectionEvent:
 @dataclass
 class EngineConfig:
     """Tunable parameters — safe to change at runtime via engine.config."""
-    threshold:        float = 0.24       # initial; tune with tools/threshold_tuner.py
-    rolling_window:   int   = 3          # increase for fewer false positives
+    threshold:        float = 0.60       # production floor; tune with tools/threshold_tuner.py
+    rolling_window:   int   = 5          # score smoothing window
+    required_hits:    int   = 3          # consecutive frames over threshold before trigger
     cooldown_secs:    float = COOLDOWN_SECS
     rms_gate:         float = RMS_SILENCE_GATE
+    vad_aggressiveness: int = 3          # 3 = strictest WebRTC VAD
+    vad_frame_ms:     int   = 20         # 10/20/30ms only
+    vad_required_ratio: float = 0.50     # speech frames required inside each chunk
+    dynamic_threshold: bool = True       # raise threshold when background scores drift up
+    dynamic_margin:   float = 0.08       # margin above background score statistics
+    context_ms:       int   = 1200       # rolling audio context for sklearn/ONNX features
     model_path:       Optional[str] = None   # None → use built-in hey_jarvis_v0.1
     debug_scores:     bool  = False      # print every score to stdout
 
@@ -134,8 +141,10 @@ class VADFilter:
     WebRTC VAD wrapper. Falls back gracefully if webrtcvad is not installed.
     Mode 3 = most aggressive (fewer false positives in noisy environments).
     """
-    def __init__(self, aggressiveness: int = 3):
+    def __init__(self, aggressiveness: int = 3, frame_ms: int = 20, required_ratio: float = 0.50):
         self._vad = None
+        self._frame_ms = frame_ms if frame_ms in (10, 20, 30) else 20
+        self._required_ratio = max(0.0, min(1.0, required_ratio))
         try:
             import webrtcvad
             self._vad = webrtcvad.Vad(aggressiveness)
@@ -146,16 +155,30 @@ class VADFilter:
     def is_speech(self, pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> bool:
         """Returns True if the audio frame is speech (or if VAD unavailable)."""
         if self._vad is None:
-            return True
+            return self._energy_fallback(pcm_bytes)
         # WebRTC VAD requires exactly 10/20/30ms frames
-        frame_ms   = 30
-        frame_size = int(sample_rate * frame_ms / 1000) * 2  # * 2 for int16 bytes
+        frame_size = int(sample_rate * self._frame_ms / 1000) * 2  # * 2 for int16 bytes
         if len(pcm_bytes) < frame_size:
-            return True
+            return self._energy_fallback(pcm_bytes)
         try:
-            return self._vad.is_speech(pcm_bytes[:frame_size], sample_rate)
+            total = 0
+            voiced = 0
+            for offset in range(0, len(pcm_bytes) - frame_size + 1, frame_size):
+                total += 1
+                frame = pcm_bytes[offset:offset + frame_size]
+                if self._vad.is_speech(frame, sample_rate):
+                    voiced += 1
+            if total == 0:
+                return self._energy_fallback(pcm_bytes)
+            return (voiced / total) >= self._required_ratio
         except Exception:
-            return True
+            return self._energy_fallback(pcm_bytes)
+
+    @staticmethod
+    def _energy_fallback(pcm_bytes: bytes) -> bool:
+        """Strict fallback when WebRTC VAD is unavailable or errors."""
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16)
+        return rms(audio) >= max(RMS_SILENCE_GATE * 1.5, 120.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -204,6 +227,14 @@ class WakeWordDetector:
         self._model = None
         self._model_key: Optional[str] = None
         self._scores: deque = deque(maxlen=config.rolling_window)
+        self._raw_scores: deque = deque(maxlen=max(config.rolling_window, 1))
+        self._background_scores: deque = deque(maxlen=250)
+        self._consecutive_hits = 0
+        self._context_samples = max(CHUNK_SAMPLES, int(SAMPLE_RATE * config.context_ms / 1000))
+        self._audio_context = np.zeros(0, dtype=np.int16)
+        self._n_features = 96 * 32
+        self._onnx_session = None
+        self._onnx_input = None
         self._load_model()
 
     def _load_model(self):
@@ -222,17 +253,12 @@ class WakeWordDetector:
             pkl_path = p.with_suffix(".pkl")
             if pkl_path.exists():
                 try:
-                    import pickle, json
+                    import pickle
                     with open(pkl_path, "rb") as f:
                         self._sklearn_model = pickle.load(f)
                     self._model = "sklearn"
                     self._model_key = pkl_path.stem
-                    # Load feature config from json metadata
-                    json_path = pkl_path.with_suffix(".json")
-                    self._n_features = 40  # default
-                    if json_path.exists():
-                        meta = json.loads(json_path.read_text())
-                        self._n_features = meta.get("n_features", 40)
+                    self._n_features = self._infer_sklearn_feature_count(self._sklearn_model)
                     # Warm-up
                     dummy = np.zeros(self._n_features, dtype=np.float32)
                     self._sklearn_model.predict_proba([dummy])
@@ -241,6 +267,35 @@ class WakeWordDetector:
                     return
                 except Exception as e:
                     log.warning("[WW] sklearn pkl load failed: %s", e)
+
+            if p.exists() and p.suffix.lower() == ".onnx":
+                try:
+                    from openwakeword.model import Model as OWWModel
+                    self._model = OWWModel(
+                        wakeword_models=[str(p)],
+                        inference_framework="onnx",
+                        enable_speex_noise_suppression=False,
+                    )
+                    self._model_key = p.stem
+                    self._model.predict(np.zeros(CHUNK_SAMPLES, dtype=np.int16))
+                    log.info("[WW] Loaded custom OpenWakeWord ONNX model: %s", p)
+                    return
+                except Exception as e:
+                    log.warning("[WW] custom OpenWakeWord ONNX load failed: %s", e)
+
+                try:
+                    import onnxruntime as ort
+                    self._onnx_session = ort.InferenceSession(str(p), providers=["CPUExecutionProvider"])
+                    self._onnx_input = self._onnx_session.get_inputs()[0].name
+                    self._n_features = self._infer_onnx_feature_count(self._onnx_session)
+                    self._model = "sklearn_onnx"
+                    self._model_key = p.stem
+                    dummy = np.zeros((1, self._n_features), dtype=np.float32)
+                    self._onnx_session.run(None, {self._onnx_input: dummy})
+                    log.info("[WW] Loaded sklearn ONNX model: %s (features=%d)", p, self._n_features)
+                    return
+                except Exception as e:
+                    log.warning("[WW] sklearn ONNX load failed: %s", e)
 
         # ── Try OWW built-in (fallback) ──────────────────────────────────────
         try:
@@ -261,6 +316,34 @@ class WakeWordDetector:
     @property
     def ready(self) -> bool:
         return self._model is not None
+
+    @staticmethod
+    def _infer_sklearn_feature_count(model) -> int:
+        """Read feature width from a sklearn pipeline/model."""
+        for attr_owner in (
+            getattr(model, "named_steps", {}).get("scaler") if hasattr(model, "named_steps") else None,
+            getattr(model, "named_steps", {}).get("mlp") if hasattr(model, "named_steps") else None,
+            model,
+        ):
+            if attr_owner is None:
+                continue
+            n_features = getattr(attr_owner, "n_features_in_", None)
+            if n_features:
+                return int(n_features)
+        return 96 * 32
+
+    @staticmethod
+    def _infer_onnx_feature_count(session) -> int:
+        shape = session.get_inputs()[0].shape
+        if len(shape) >= 2 and isinstance(shape[1], int):
+            return int(shape[1])
+        return 96 * 32
+
+    def _push_context(self, audio: np.ndarray) -> np.ndarray:
+        self._audio_context = np.concatenate((self._audio_context, audio.astype(np.int16)))
+        if len(self._audio_context) > self._context_samples:
+            self._audio_context = self._audio_context[-self._context_samples:]
+        return self._audio_context
 
     def _extract_features(self, audio: np.ndarray) -> np.ndarray:
         """
@@ -291,6 +374,63 @@ class WakeWordDetector:
         mean = np.mean(arr, axis=0)
         return mean[:n_features].astype(np.float32)
 
+    def _extract_features(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Extract the same 96x32 log-mel window used by wake/train.py.
+        This overrides the older single-chunk FFT extractor above.
+        """
+        target_features = getattr(self, "_n_features", 96 * 32)
+        n_mels = 32
+        n_frames = max(1, target_features // n_mels)
+        y = audio.astype(np.float32) / 32768.0
+
+        if len(y) < SAMPLE_RATE:
+            y = np.pad(y, (SAMPLE_RATE - len(y), 0))
+        else:
+            y = y[-SAMPLE_RATE:]
+
+        try:
+            import librosa
+            y = librosa.effects.preemphasis(y, coef=0.97)
+            mel = librosa.feature.melspectrogram(
+                y=y,
+                sr=SAMPLE_RATE,
+                n_mels=n_mels,
+                hop_length=160,
+                win_length=400,
+                power=2.0,
+            )
+            feat = librosa.power_to_db(mel, ref=np.max).T
+        except Exception:
+            feat = self._fallback_logmel(y, n_mels=n_mels)
+
+        if len(feat) < n_frames:
+            feat = np.pad(feat, ((n_frames - len(feat), 0), (0, 0)), constant_values=-80.0)
+        feat = feat[-n_frames:].astype(np.float32)
+        feat = (feat - np.mean(feat)) / (np.std(feat) + 1e-6)
+        flat = feat.reshape(-1)
+        if len(flat) < target_features:
+            flat = np.pad(flat, (0, target_features - len(flat)))
+        return flat[:target_features].astype(np.float32)
+
+    @staticmethod
+    def _fallback_logmel(y: np.ndarray, n_mels: int = 32) -> np.ndarray:
+        frame_size = 400
+        hop_size = 160
+        rows = []
+        for start in range(0, max(1, len(y) - frame_size + 1), hop_size):
+            frame = y[start:start + frame_size]
+            if len(frame) < frame_size:
+                frame = np.pad(frame, (0, frame_size - len(frame)))
+            spectrum = np.abs(np.fft.rfft(frame * np.hanning(frame_size))) ** 2
+            band_edges = np.linspace(0, len(spectrum), n_mels + 1, dtype=int)
+            bands = []
+            for idx in range(n_mels):
+                lo, hi = band_edges[idx], max(band_edges[idx + 1], band_edges[idx] + 1)
+                bands.append(10.0 * np.log10(np.mean(spectrum[lo:hi]) + 1e-10))
+            rows.append(bands)
+        return np.array(rows, dtype=np.float32)
+
     def predict(self, audio: np.ndarray) -> float:
         """
         Run inference on one chunk. Returns rolling-averaged confidence score.
@@ -301,10 +441,17 @@ class WakeWordDetector:
         try:
             # ── sklearn pkl path ─────────────────────────────────────────
             if self._model == "sklearn":
-                feats = self._extract_features(audio).reshape(1, -1)
+                context = self._push_context(audio)
+                feats = self._extract_features(context).reshape(1, -1)
                 proba = self._sklearn_model.predict_proba(feats)[0]
                 # proba[1] = probability of class 1 (wake word)
                 raw = float(proba[1]) if len(proba) > 1 else float(proba[0])
+
+            elif self._model == "sklearn_onnx":
+                context = self._push_context(audio)
+                feats = self._extract_features(context).reshape(1, -1).astype(np.float32)
+                outputs = self._onnx_session.run(None, {self._onnx_input: feats})
+                raw = self._extract_onnx_probability(outputs)
 
             # ── OWW built-in path ────────────────────────────────────────
             else:
@@ -316,6 +463,9 @@ class WakeWordDetector:
                         break
                     raw = max(raw, float(val))
 
+            self._raw_scores.append(raw)
+            if raw < self.config.threshold * 0.75:
+                self._background_scores.append(raw)
             self._scores.append(raw)
             avg = float(np.mean(self._scores))
 
@@ -330,9 +480,43 @@ class WakeWordDetector:
             log.debug("[WW] predict error: %s", e)
             return 0.0
 
+    @staticmethod
+    def _extract_onnx_probability(outputs) -> float:
+        """Handle sklearn-onnx probability outputs across converter versions."""
+        for output in outputs:
+            if isinstance(output, list) and output and isinstance(output[0], dict):
+                probs = output[0]
+                return float(probs.get(1, probs.get("1", max(probs.values()))))
+            arr = np.asarray(output)
+            if arr.ndim == 2 and arr.shape[1] > 1 and np.issubdtype(arr.dtype, np.number):
+                return float(arr[0, 1])
+            if arr.size == 1 and np.issubdtype(arr.dtype, np.number):
+                return float(arr.reshape(-1)[0])
+        return 0.0
+
+    def current_threshold(self) -> float:
+        """Adaptive threshold: never below config.threshold, higher in noisy rooms."""
+        base = float(self.config.threshold)
+        if not self.config.dynamic_threshold or len(self._background_scores) < 25:
+            return base
+        bg = np.array(self._background_scores, dtype=np.float32)
+        adaptive = float(np.mean(bg) + 3.0 * np.std(bg) + self.config.dynamic_margin)
+        return min(0.95, max(base, adaptive))
+
+    def is_confirmed(self, score: float) -> bool:
+        """Require a sliding average plus N consecutive hits above threshold."""
+        threshold = self.current_threshold()
+        if score >= threshold:
+            self._consecutive_hits += 1
+        else:
+            self._consecutive_hits = 0
+        return self._consecutive_hits >= max(1, self.config.required_hits)
+
     def reset_window(self):
         """Clear rolling window (call after activation)."""
         self._scores.clear()
+        self._raw_scores.clear()
+        self._consecutive_hits = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -433,7 +617,11 @@ class WakeEngine:
         self._audio_q: queue.Queue = queue.Queue(maxsize=64)
 
         # Sub-systems
-        self._vad      = VADFilter()
+        self._vad      = VADFilter(
+            aggressiveness=self.config.vad_aggressiveness,
+            frame_ms=self.config.vad_frame_ms,
+            required_ratio=self.config.vad_required_ratio,
+        )
         self._ns       = NoiseSupressor()
         self._detector = WakeWordDetector(self.config)
         self._verifier = SpeakerVerifier()
@@ -569,10 +757,12 @@ class WakeEngine:
             # ── 3. Silence gate (save CPU on quiet environments) ─────────
             audio_rms = rms(chunk)
             if audio_rms < self.config.rms_gate:
+                self._detector.reset_window()
                 continue
 
             # ── 4. WebRTC VAD ────────────────────────────────────────────
             if not self._vad.is_speech(chunk.tobytes()):
+                self._detector.reset_window()
                 continue
 
             # ── 5. Noise suppression ─────────────────────────────────────
@@ -585,7 +775,7 @@ class WakeEngine:
                 self.on_score(score)
 
             # ── 7. Threshold check ───────────────────────────────────────
-            if score < self.config.threshold:
+            if not self._detector.is_confirmed(score):
                 continue
 
             # ── 8. Cooldown guard ────────────────────────────────────────

@@ -59,6 +59,13 @@ CHUNK_SAMPLES   = 1280          # 80 ms @ 16 kHz — required by OpenWakeWord
 MIN_CLIP_SECS   = 0.5
 MAX_CLIP_SECS   = 4.0
 
+# Fallback sklearn feature contract. Keep this in sync with wake/engine.py.
+FEATURE_N_MELS = 32
+FEATURE_HOP_LEN = 160
+FEATURE_WIN_LEN = 400
+FEATURE_N_FRAMES = 96
+FEATURE_MAX_SECS = 3.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STEP 0 — DIAGNOSTICS
@@ -443,11 +450,11 @@ def extract_features(clips: list[Path], label: int) -> tuple[np.ndarray, np.ndar
         )
         sys.exit(1)
 
-    N_MELS   = 32
-    HOP_LEN  = 160      # 10ms @ 16kHz
-    WIN_LEN  = 400      # 25ms @ 16kHz
-    N_FRAMES = 96       # ~1 second of context
-    MAX_SECS = 3.0
+    N_MELS   = FEATURE_N_MELS
+    HOP_LEN  = FEATURE_HOP_LEN      # 10ms @ 16kHz
+    WIN_LEN  = FEATURE_WIN_LEN      # 25ms @ 16kHz
+    N_FRAMES = FEATURE_N_FRAMES     # ~1 second of context
+    MAX_SECS = FEATURE_MAX_SECS
 
     features, labels = [], []
 
@@ -457,6 +464,7 @@ def extract_features(clips: list[Path], label: int) -> tuple[np.ndarray, np.ndar
                                  duration=MAX_SECS)
             if len(y) < CHUNK_SAMPLES:
                 continue
+            y = librosa.effects.preemphasis(y, coef=0.97)
 
             mel = librosa.feature.melspectrogram(
                 y=y, sr=sr, n_mels=N_MELS,
@@ -471,6 +479,8 @@ def extract_features(clips: list[Path], label: int) -> tuple[np.ndarray, np.ndar
                     # Pad if clip is shorter than N_FRAMES
                     window = np.pad(window, ((0, N_FRAMES - len(window)), (0, 0)),
                                     mode="constant", constant_values=-80)
+                window = window.astype(np.float32)
+                window = (window - np.mean(window)) / (np.std(window) + 1e-6)
                 features.append(window)
                 labels.append(label)
 
@@ -574,14 +584,16 @@ def _train_sklearn_onnx(splits: dict, output_path: Path, epochs: int):
         log.error("  No features extracted from positive clips. Check audio format.")
         sys.exit(1)
 
-    X = np.concatenate([X_pos, X_neg]) if len(X_neg) > 0 else X_pos
-    y = np.concatenate([y_pos, y_neg]) if len(y_neg) > 0 else y_pos
+    X, y = _balanced_binary_dataset(X_pos, y_pos, X_neg, y_neg)
 
     # Flatten (n_samples, frames, mels) → (n_samples, frames*mels)
     n_samples = len(X)
     X_flat = X.reshape(n_samples, -1)
 
-    print(f"  Training MLP on {n_samples} samples ({len(X_pos)} positive, {len(X_neg)} negative)...")
+    print(
+        f"  Training MLP on {n_samples} balanced windows "
+        f"({int(np.sum(y == 1))} positive, {int(np.sum(y == 0))} negative)..."
+    )
 
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
@@ -602,6 +614,33 @@ def _train_sklearn_onnx(splits: dict, output_path: Path, epochs: int):
     _export_sklearn_onnx(pipeline, X_flat[:1], output_path)
     print(f"\n  ✔ Model trained and saved: {output_path}")
     _save_model_metadata(output_path, n_samples, len(X_pos), len(X_neg))
+
+
+def _balanced_binary_dataset(
+    X_pos: np.ndarray,
+    y_pos: np.ndarray,
+    X_neg: np.ndarray,
+    y_neg: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Balance positive/negative feature windows before classifier training."""
+    if len(X_neg) == 0:
+        log.warning("  No negatives available; false positives will be high.")
+        return X_pos, y_pos
+
+    rng = np.random.default_rng(42)
+    target = max(len(X_pos), len(X_neg))
+
+    def sample_to_target(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        replace = len(X) < target
+        idx = rng.choice(len(X), size=target, replace=replace)
+        return X[idx], y[idx]
+
+    Xp, yp = sample_to_target(X_pos, y_pos)
+    Xn, yn = sample_to_target(X_neg, y_neg)
+    X = np.concatenate([Xp, Xn])
+    y = np.concatenate([yp, yn])
+    order = rng.permutation(len(X))
+    return X[order], y[order]
 
 
 def _export_sklearn_onnx(pipeline, X_sample: np.ndarray, output_path: Path):
@@ -637,6 +676,14 @@ def _save_model_metadata(output_path: Path, n_total: int, n_pos: int, n_neg: int
         "trained": datetime.datetime.now().isoformat(),
         "samples": {"total": n_total, "positive": n_pos, "negative": n_neg},
         "audio": {"sample_rate": REQUIRED_SR, "channels": REQUIRED_CH, "bits": REQUIRED_BITS},
+        "features": {
+            "type": "log_mel_cmvn",
+            "n_mels": FEATURE_N_MELS,
+            "n_frames": FEATURE_N_FRAMES,
+            "hop_length": FEATURE_HOP_LEN,
+            "win_length": FEATURE_WIN_LEN,
+            "n_features": FEATURE_N_MELS * FEATURE_N_FRAMES,
+        },
     }
     meta_path = output_path.with_suffix(".json")
     with open(str(meta_path), "w") as f:

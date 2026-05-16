@@ -24,16 +24,16 @@ CHUNK_MS      = 80             # ms per chunk — 80ms is openwakeword's sweet s
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_MS / 1000)   # = 1280 samples
 
 # ── Wake Word Detection ──────────────────────────────────────────────────────
+CUSTOM_WAKE_MODEL = MODELS_DIR / "hey_jarvis_custom.onnx"
 WAKE_MODELS = [
-    "alexa",         # bundled openwakeword model
-    # "hey_jarvis_custom.onnx" # uncomment after training your own
+    str(CUSTOM_WAKE_MODEL) if CUSTOM_WAKE_MODEL.exists() else "alexa",
 ]
-WAKE_THRESHOLD          = 0.35   # 0.0–1.0 — higher = fewer false positives
+WAKE_THRESHOLD          = 0.60   # 0.0–1.0 — higher = fewer false positives
 WAKE_COOLDOWN_SECONDS   = 2.0    # minimum gap between detections
-WAKE_ROLLING_WINDOW     = 1      # confirm over N consecutive chunks (reduces false +)
+WAKE_ROLLING_WINDOW     = 3      # confirm over N consecutive chunks (reduces false +)
 
 # ── Voice Activity Detection ─────────────────────────────────────────────────
-VAD_AGGRESSIVENESS      = 2      # 0=least, 3=most aggressive filtering
+VAD_AGGRESSIVENESS      = 3      # 0=least, 3=most aggressive filtering
 VAD_FRAME_MS            = 20     # WebRTC VAD frame size (10, 20, or 30 ms only)
 VAD_SILENCE_THRESHOLD_S = 1.2    # stop recording after this many seconds of silence
 VAD_MIN_SPEECH_S        = 0.3    # discard if total speech shorter than this

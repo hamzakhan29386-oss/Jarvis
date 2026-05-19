@@ -132,6 +132,16 @@ class WorldStateEngine:
         emit("world_state_snapshot", snap, source="world_state")
         return snap
 
+    def operating_context(self) -> Dict[str, Any]:
+        state = self.get_state()
+        return {
+            "active_project": ActiveProjectTracker(state).current(),
+            "workflow_patterns": WorkflowPatternEngine(state).patterns(),
+            "goal_memory": ContextualGoalMemory(state).active(),
+            "temporal_context": TemporalReasoningEngine(state).recent(),
+            "environment_graph": EnvironmentGraph(state).snapshot(),
+        }
+
     def refresh_environment(self) -> Dict[str, Any]:
         updates: Dict[str, Any] = {"current_workspace": os.getcwd()}
         try:
@@ -175,6 +185,60 @@ class WorldStateEngine:
 
     def _on_memory_event(self, event) -> None:
         self.update_state("last_memory_update", event.payload, source="memory")
+
+
+class ActiveProjectTracker:
+    def __init__(self, state: Dict[str, Any]):
+        self.state = state
+
+    def current(self) -> Dict[str, Any]:
+        return {
+            "active_coding_project": self.state.get("active_coding_project"),
+            "current_workspace": self.state.get("current_workspace"),
+            "focused_application": self.state.get("focused_application"),
+        }
+
+
+class WorkflowPatternEngine:
+    def __init__(self, state: Dict[str, Any]):
+        self.state = state
+
+    def patterns(self) -> list:
+        return self.state.get("ongoing_workflows", [])
+
+
+class ContextualGoalMemory:
+    def __init__(self, state: Dict[str, Any]):
+        self.state = state
+
+    def active(self) -> list:
+        return self.state.get("active_goals", [])
+
+
+class TemporalReasoningEngine:
+    def __init__(self, state: Dict[str, Any]):
+        self.state = state
+
+    def recent(self) -> Dict[str, Any]:
+        return {
+            "updated_at": self.state.get("updated_at"),
+            "recent_actions": self.state.get("recent_actions", [])[-10:],
+        }
+
+
+class EnvironmentGraph:
+    def __init__(self, state: Dict[str, Any]):
+        self.state = state
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "applications": self.state.get("open_applications", []),
+            "browser": self.state.get("browser_context", {}),
+            "terminal": self.state.get("terminal_state", {}),
+        }
+
+
+WorldStateManager = WorldStateEngine
 
 
 _world: Optional[WorldStateEngine] = None

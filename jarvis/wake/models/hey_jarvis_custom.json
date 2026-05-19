@@ -1,9 +1,9 @@
 {
   "model": "hey_jarvis_custom.onnx",
   "wake_word": "hey jarvis",
-  "trained": "2026-05-12T15:13:36.887399",
+  "trained": "2026-05-16T17:56:28.796422",
   "samples": {
-    "total": 1584,
+    "total": 2208,
     "positive": 1104,
     "negative": 480
   },
@@ -11,5 +11,13 @@
     "sample_rate": 16000,
     "channels": 1,
     "bits": 16
+  },
+  "features": {
+    "type": "log_mel_cmvn",
+    "n_mels": 32,
+    "n_frames": 96,
+    "hop_length": 160,
+    "win_length": 400,
+    "n_features": 3072
   }
 }

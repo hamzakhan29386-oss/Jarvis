@@ -179,6 +179,7 @@ class MemorySystem:
             "procedures": [],
             "working_memory": [],
             "world_state_memory": [],
+            "long_term_abstractions": [],
         }
 
         # Load existing data from disk
@@ -211,6 +212,8 @@ class MemorySystem:
                     self._data["working_memory"] = loaded["working_memory"]
                 if "world_state_memory" in loaded:
                     self._data["world_state_memory"] = loaded["world_state_memory"]
+                if "long_term_abstractions" in loaded:
+                    self._data["long_term_abstractions"] = loaded["long_term_abstractions"]
                 log.info(f"[Memory] Loaded from {MEMORY_FILE}")
         except (json.JSONDecodeError, IOError) as e:
             log.warning(f"[Memory] Could not load memory file: {e}")
@@ -404,13 +407,26 @@ class MemorySystem:
             if not query_embedding:
                 return []
 
-            # Score each episode by cosine similarity
+            # Score each episode by semantic match, importance, recency, and active context.
             scored = []
             for ep in episodes:
                 ep_emb = ep.get("embedding", [])
                 if not ep_emb:
                     continue
-                score = self._embedder.similarity(query_embedding, ep_emb)
+                similarity = self._embedder.similarity(query_embedding, ep_emb)
+                recency = self._recency_decay(ep.get("timestamp"))
+                importance = float(ep.get("importance_score", 0.35))
+                project = float(ep.get("project_score", 0.3))
+                working = self._working_memory_boost(query)
+                score = (
+                    similarity * 0.62
+                    + importance * 0.18
+                    + recency * 0.12
+                    + project * 0.05
+                    + working * 0.03
+                )
+                ep["relevance_score"] = round(score, 4)
+                ep["recency_score"] = round(recency, 4)
                 scored.append((score, ep))
 
             # Sort by score descending, take top_k
@@ -426,6 +442,83 @@ class MemorySystem:
         except Exception as e:
             log.error(f"[Memory] Retrieval failed: {e}")
             return []
+
+    def _recency_decay(self, iso_timestamp: str | None, half_life_days: float = 14.0) -> float:
+        if not iso_timestamp:
+            return 0.5
+        try:
+            dt = datetime.fromisoformat(iso_timestamp)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_days = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400)
+            return round(0.5 ** (age_days / half_life_days), 4)
+        except Exception:
+            return 0.5
+
+    def _working_memory_boost(self, query: str) -> float:
+        active = self.get_working_memory()
+        if not active:
+            return 0.0
+        q = query.lower()
+        boost = 0.0
+        for item in active:
+            text = json.dumps(item, ensure_ascii=False).lower()
+            if any(term for term in q.split() if len(term) > 3 and term in text):
+                boost += 0.2
+        return min(1.0, boost)
+
+    def consolidate(self, limit: int = 50) -> dict:
+        """Create a compact long-term abstraction from recent high-value episodes."""
+        episodes = sorted(
+            self._data.get("episodes", [])[-limit:],
+            key=lambda ep: (float(ep.get("importance_score", 0)), ep.get("timestamp", "")),
+            reverse=True,
+        )
+        if not episodes:
+            return {"ok": False, "reason": "no_episodes"}
+        themes = [ep.get("summary", "")[:180] for ep in episodes[:12] if ep.get("summary")]
+        abstraction = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "summary": " | ".join(themes),
+            "source_episode_count": len(episodes),
+            "importance_score": round(sum(float(ep.get("importance_score", 0.35)) for ep in episodes) / len(episodes), 3),
+        }
+        with self._lock:
+            self._data.setdefault("long_term_abstractions", []).append(abstraction)
+            self._data["long_term_abstractions"] = self._data["long_term_abstractions"][-100:]
+        threading.Thread(target=self._save, daemon=True).start()
+        try:
+            from event_bus import emit
+
+            emit("memory_consolidated", abstraction, source="memory")
+        except Exception:
+            pass
+        return {"ok": True, "abstraction": abstraction}
+
+    def prune_memories(self, retention_days: int = 365, min_importance: float = 0.2) -> dict:
+        """Prune old low-importance episodes while preserving high-value memories."""
+        cutoff = time.time() - retention_days * 86400
+        before = len(self._data.get("episodes", []))
+        kept = []
+        for ep in self._data.get("episodes", []):
+            try:
+                ts = datetime.fromisoformat(ep["timestamp"]).timestamp()
+            except Exception:
+                ts = time.time()
+            importance = float(ep.get("importance_score", 0.35))
+            if ts >= cutoff or importance >= min_importance:
+                kept.append(ep)
+        with self._lock:
+            self._data["episodes"] = kept[-MAX_EPISODES:]
+        threading.Thread(target=self._save, daemon=True).start()
+        result = {"before": before, "after": len(kept), "pruned": before - len(kept)}
+        try:
+            from event_bus import emit
+
+            emit("memory_pruned", result, source="memory")
+        except Exception:
+            pass
+        return result
 
     def get_recent_episodes(self, count: int = 10) -> list:
         """Get the most recent episodes (for conversation history display)."""
@@ -760,6 +853,8 @@ Rules:
         return {
             "total_episodes": len(self._data["episodes"]),
             "total_procedures": len(self._data["procedures"]),
+            "working_memory": len(self._data.get("working_memory", [])),
+            "long_term_abstractions": len(self._data.get("long_term_abstractions", [])),
             "user_name": self._data["semantic"]["identity"].get("name", "unknown"),
             "projects_count": len(self._data["semantic"].get("projects", [])),
             "goals_count": len(self._data["semantic"].get("goals", [])),

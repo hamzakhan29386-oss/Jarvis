@@ -25,9 +25,7 @@ CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_MS / 1000)   # = 1280 samples
 
 # ── Wake Word Detection ──────────────────────────────────────────────────────
 CUSTOM_WAKE_MODEL = MODELS_DIR / "hey_jarvis_custom.onnx"
-WAKE_MODELS = [
-    str(CUSTOM_WAKE_MODEL) if CUSTOM_WAKE_MODEL.exists() else "alexa",
-]
+WAKE_MODELS = [str(CUSTOM_WAKE_MODEL)]
 WAKE_THRESHOLD          = 0.60   # 0.0–1.0 — higher = fewer false positives
 WAKE_COOLDOWN_SECONDS   = 2.0    # minimum gap between detections
 WAKE_ROLLING_WINDOW     = 3      # confirm over N consecutive chunks (reduces false +)

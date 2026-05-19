@@ -121,7 +121,9 @@ class AutonomousAgentLoop:
         emit("task_started", plan, source="agent_loop")
         payload = plan.get("payload", {})
         if plan["kind"] == "tool":
-            result = get_tool_registry().execute(payload["name"], payload.get("args", {}))
+            from agents.closed_loop import get_closed_loop_executor
+
+            result = get_closed_loop_executor().run_action(payload["name"], payload.get("args", {}))
         elif plan["kind"] == "goal_subtask":
             subtask = payload["subtask"]
             result = {"ok": True, "message": f"Ready for subtask: {subtask['title']}", "subtask_id": subtask["id"]}

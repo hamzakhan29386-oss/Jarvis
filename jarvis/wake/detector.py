@@ -14,6 +14,7 @@ Requirements:
 import logging
 import time
 from collections import deque
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -59,10 +60,16 @@ class WakeWordEngine:
     def _init(self):
         try:
             from openwakeword.model import Model
-            self._model = Model(
-                wakeword_models=self._models_cfg,
-                inference_framework="onnx",
-            )
+            model_paths, builtin_models = self._resolve_models()
+            model_kwargs = {"inference_framework": "onnx"}
+            if model_paths:
+                model_kwargs["model_paths"] = model_paths
+                if builtin_models:
+                    model_kwargs["wakeword_models"] = builtin_models
+            else:
+                model_kwargs["wakeword_models"] = builtin_models
+
+            self._model = Model(**model_kwargs)
             # Seed score windows for every model key
             for key in self._model.prediction_buffer.keys():
                 self._score_windows[key] = deque(maxlen=self._rolling_window)
@@ -78,6 +85,22 @@ class WakeWordEngine:
             )
         except Exception as e:
             log.error(f"[Detector] Init failed: {e}")
+
+    def _resolve_models(self) -> tuple[list[str], list[str]]:
+        """Split configured models into custom file paths and built-in model names."""
+        model_paths: list[str] = []
+        builtin_models: list[str] = []
+        for model in self._models_cfg:
+            model_value = str(model)
+            path = Path(model_value)
+            is_custom_path = path.suffix.lower() in {".onnx", ".tflite"}
+            if is_custom_path:
+                if not path.exists():
+                    raise FileNotFoundError(f"Wake model not found: {path}")
+                model_paths.append(str(path))
+            else:
+                builtin_models.append(model_value)
+        return model_paths, builtin_models
 
     @property
     def available(self) -> bool:

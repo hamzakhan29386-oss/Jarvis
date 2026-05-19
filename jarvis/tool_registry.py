@@ -111,9 +111,40 @@ class ToolRegistry:
 _registry: Optional[ToolRegistry] = None
 
 
+def _wrap_web_search_sync(**kwargs) -> str:
+    """Synchronous wrapper for the async web_search skill."""
+    import asyncio
+    from skills.web_search import search_web
+
+    query = kwargs.get("query", "")
+    max_results = kwargs.get("max_results", 5)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(search_web(query, max_results))
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        return pool.submit(asyncio.run, search_web(query, max_results)).result()
+
+
 def get_tool_registry() -> ToolRegistry:
     global _registry
     if _registry is None:
         _registry = ToolRegistry()
         _registry.load_from_actions()
+
+        # ── Register Tavily web search skill ─────────────────────────────
+        _registry.register(
+            _wrap_web_search_sync,
+            ToolMetadata(
+                name="web_search",
+                description="Search the live web via Tavily for real-time information.",
+                permissions=[],
+                safety_level="low",
+                retry_policy={"retries": 2, "cooldown": 1.0},
+                capabilities=["web search", "live news", "current events", "real-time data"],
+                latency_estimate_ms=3000,
+            ),
+        )
     return _registry

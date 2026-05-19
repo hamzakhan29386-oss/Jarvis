@@ -13,7 +13,7 @@ from wake.detector import WakeWordEngine
 from wake.noise import NoisePipeline
 from wake.speaker import SpeakerVerifier
 
-from .audio_input import AudioInputConfig, NativeAudioInput
+from .audio_multiplexer import AudioSubscriber, get_audio_multiplexer
 from .resampler import AudioResampler, float32_to_int16
 
 log = logging.getLogger("jarvis.voice.wake_listener")
@@ -23,7 +23,8 @@ class NativeWakeListener:
     """Continuous wake detector with callback-based audio capture and worker processing."""
 
     def __init__(self):
-        self.audio = NativeAudioInput(AudioInputConfig())
+        self.audio = get_audio_multiplexer()
+        self._subscription: AudioSubscriber | None = None
         self.resampler = AudioResampler()
         self.noise = NoisePipeline()
         self.detector = WakeWordEngine()
@@ -31,6 +32,7 @@ class NativeWakeListener:
         self.on_detected = None
         self.on_error = None
         self._stop = threading.Event()
+        self._paused = threading.Event()
         self._thread: threading.Thread | None = None
         self._running = False
         self._buffer = np.empty(0, dtype=np.int16)
@@ -48,7 +50,9 @@ class NativeWakeListener:
         if not self.detector.available:
             raise RuntimeError("Wake detector unavailable")
         self._stop.clear()
+        self._paused.clear()
         self.audio.start()
+        self._subscription = self.audio.subscribe("wake", maxsize=128)
         self._thread = threading.Thread(target=self._process_loop, daemon=True, name="JARVISNativeWakeProcess")
         self._thread.start()
         self._running = True
@@ -56,16 +60,30 @@ class NativeWakeListener:
 
     def stop(self) -> None:
         self._stop.set()
+        self.audio.unsubscribe(self._subscription)
+        self._subscription = None
         self.audio.stop()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
         self._running = False
         log.info("[WakeListener] Stopped | chunks=%d status=%s", self._chunks_processed, self.audio.get_status())
 
+    def pause(self) -> None:
+        self._paused.set()
+
+    def resume(self) -> None:
+        self._paused.clear()
+
     def _process_loop(self) -> None:
         while not self._stop.is_set():
-            frame = self.audio.read(timeout=0.5)
+            subscription = self._subscription
+            if subscription is None:
+                time.sleep(0.1)
+                continue
+            frame = subscription.read(timeout=0.5)
             if frame is None:
+                continue
+            if self._paused.is_set():
                 continue
 
             t0 = time.perf_counter()
@@ -96,8 +114,8 @@ class NativeWakeListener:
                 log.debug(
                     "[WakeListener] chunks=%d queue=%d drops=%d latency=%.1fms",
                     self._chunks_processed,
-                    self.audio.queue.qsize(),
-                    self.audio.stats.frames_dropped,
+                    self._subscription.queue.qsize() if self._subscription else 0,
+                    self._subscription.frames_dropped if self._subscription else 0,
                     self._last_latency_ms,
                 )
             return
@@ -113,8 +131,8 @@ class NativeWakeListener:
             "keyword": keyword,
             "score": round(float(score), 3),
             "latency_ms": round(self._last_latency_ms, 1),
-            "queue_size": self.audio.queue.qsize(),
-            "dropped_frames": self.audio.stats.frames_dropped,
+            "queue_size": self._subscription.queue.qsize() if self._subscription else 0,
+            "dropped_frames": self._subscription.frames_dropped if self._subscription else 0,
             "sample_rate": SAMPLE_RATE,
         }
         self._last_detection = event
@@ -123,8 +141,8 @@ class NativeWakeListener:
             keyword,
             score,
             self._last_latency_ms,
-            self.audio.queue.qsize(),
-            self.audio.stats.frames_dropped,
+            self._subscription.queue.qsize() if self._subscription else 0,
+            self._subscription.frames_dropped if self._subscription else 0,
         )
         if self.on_detected:
             self.on_detected(event)
@@ -132,6 +150,7 @@ class NativeWakeListener:
     def get_status(self) -> dict:
         return {
             "running": self._running,
+            "paused": self._paused.is_set(),
             "available": self.detector.available,
             "chunks_processed": self._chunks_processed,
             "last_latency_ms": round(self._last_latency_ms, 1),

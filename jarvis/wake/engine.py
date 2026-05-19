@@ -49,6 +49,21 @@ COOLDOWN_SECS     = 2.5
 # Silence gate: skip processing if RMS below this (saves CPU)
 RMS_SILENCE_GATE  = 80             # int16 range 0–32767
 
+# ── Feature extraction constants (MUST mirror wake/train.py exactly) ─────────
+# These are imported at module level so train.py is the single source of truth.
+try:
+    from wake.train import (
+        FEATURE_N_MELS, FEATURE_HOP_LEN, FEATURE_WIN_LEN,
+        FEATURE_N_FRAMES, FEATURE_MAX_SECS,
+    )
+except ImportError:
+    # Fallback if running engine standalone — keep in sync manually
+    FEATURE_N_MELS    = 32
+    FEATURE_HOP_LEN   = 160
+    FEATURE_WIN_LEN   = 400
+    FEATURE_N_FRAMES  = 96
+    FEATURE_MAX_SECS  = 3.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DATA CLASSES
@@ -330,14 +345,14 @@ class WakeWordDetector:
             n_features = getattr(attr_owner, "n_features_in_", None)
             if n_features:
                 return int(n_features)
-        return 96 * 32
+        return FEATURE_N_MELS * FEATURE_N_FRAMES
 
     @staticmethod
     def _infer_onnx_feature_count(session) -> int:
         shape = session.get_inputs()[0].shape
         if len(shape) >= 2 and isinstance(shape[1], int):
             return int(shape[1])
-        return 96 * 32
+        return FEATURE_N_MELS * FEATURE_N_FRAMES
 
     def _push_context(self, audio: np.ndarray) -> np.ndarray:
         self._audio_context = np.concatenate((self._audio_context, audio.astype(np.int16)))
@@ -347,89 +362,68 @@ class WakeWordDetector:
 
     def _extract_features(self, audio: np.ndarray) -> np.ndarray:
         """
-        Extract log-mel features from a 1280-sample int16 chunk.
-        Must match the feature extraction used during training.
-        """
-        n_features = getattr(self, "_n_features", 40)
-        audio_f = audio.astype(np.float32) / 32768.0
-        frame_size = 400
-        hop_size   = 160
-        features   = []
-        for start in range(0, len(audio_f) - frame_size, hop_size):
-            frame = audio_f[start:start + frame_size]
-            # Log energy in frequency bands
-            fft    = np.abs(np.fft.rfft(frame * np.hanning(frame_size)))
-            n_bins = len(fft)
-            # Split into n_features mel-like bands
-            band_size = max(1, n_bins // n_features)
-            bands = [
-                np.log1p(np.mean(fft[i*band_size:(i+1)*band_size]))
-                for i in range(n_features)
-            ]
-            features.append(bands)
-        if not features:
-            return np.zeros(n_features, dtype=np.float32)
-        # Aggregate: mean + std across frames → 2*n_features, trim to n_features
-        arr  = np.array(features, dtype=np.float32)
-        mean = np.mean(arr, axis=0)
-        return mean[:n_features].astype(np.float32)
+        Extract log-mel spectrogram features identical to wake/train.py.
 
-    def _extract_features(self, audio: np.ndarray) -> np.ndarray:
+        Uses the SAME constants (FEATURE_N_MELS, FEATURE_HOP_LEN,
+        FEATURE_WIN_LEN, FEATURE_N_FRAMES) and the SAME preprocessing
+        (preemphasis coef=0.97, power_to_db, CMVN normalisation).
+
+        This is the single source of truth for live inference features.
         """
-        Extract the same 96x32 log-mel window used by wake/train.py.
-        This overrides the older single-chunk FFT extractor above.
-        """
-        target_features = getattr(self, "_n_features", 96 * 32)
-        n_mels = 32
+        target_features = getattr(self, "_n_features", FEATURE_N_MELS * FEATURE_N_FRAMES)
+        n_mels   = FEATURE_N_MELS
+        hop_len  = FEATURE_HOP_LEN
+        win_len  = FEATURE_WIN_LEN
         n_frames = max(1, target_features // n_mels)
+
         y = audio.astype(np.float32) / 32768.0
 
-        if len(y) < SAMPLE_RATE:
-            y = np.pad(y, (SAMPLE_RATE - len(y), 0))
+        context_samples = int(SAMPLE_RATE * FEATURE_MAX_SECS)
+        if len(y) < context_samples:
+            y = np.pad(y, (context_samples - len(y), 0))
         else:
-            y = y[-SAMPLE_RATE:]
+            y = y[-context_samples:]
 
         try:
             import librosa
             y = librosa.effects.preemphasis(y, coef=0.97)
             mel = librosa.feature.melspectrogram(
-                y=y,
-                sr=SAMPLE_RATE,
-                n_mels=n_mels,
-                hop_length=160,
-                win_length=400,
-                power=2.0,
+                y=y, sr=SAMPLE_RATE, n_mels=n_mels,
+                hop_length=hop_len, win_length=win_len, power=2.0,
             )
             feat = librosa.power_to_db(mel, ref=np.max).T
         except Exception:
-            feat = self._fallback_logmel(y, n_mels=n_mels)
+            feat = self._fallback_logmel(y, n_mels=n_mels,
+                                         hop_len=hop_len, win_len=win_len)
 
         if len(feat) < n_frames:
-            feat = np.pad(feat, ((n_frames - len(feat), 0), (0, 0)), constant_values=-80.0)
+            feat = np.pad(feat, ((n_frames - len(feat), 0), (0, 0)),
+                          constant_values=-80.0)
         feat = feat[-n_frames:].astype(np.float32)
         feat = (feat - np.mean(feat)) / (np.std(feat) + 1e-6)
+
         flat = feat.reshape(-1)
         if len(flat) < target_features:
             flat = np.pad(flat, (0, target_features - len(flat)))
         return flat[:target_features].astype(np.float32)
 
     @staticmethod
-    def _fallback_logmel(y: np.ndarray, n_mels: int = 32) -> np.ndarray:
-        frame_size = 400
-        hop_size = 160
+    def _fallback_logmel(y: np.ndarray, n_mels: int = 32,
+                         hop_len: int = 160, win_len: int = 400) -> np.ndarray:
+        """Pure-numpy fallback when librosa is unavailable."""
         rows = []
-        for start in range(0, max(1, len(y) - frame_size + 1), hop_size):
-            frame = y[start:start + frame_size]
-            if len(frame) < frame_size:
-                frame = np.pad(frame, (0, frame_size - len(frame)))
-            spectrum = np.abs(np.fft.rfft(frame * np.hanning(frame_size))) ** 2
+        for start in range(0, max(1, len(y) - win_len + 1), hop_len):
+            frame = y[start:start + win_len]
+            if len(frame) < win_len:
+                frame = np.pad(frame, (0, win_len - len(frame)))
+            spectrum = np.abs(np.fft.rfft(frame * np.hanning(win_len))) ** 2
             band_edges = np.linspace(0, len(spectrum), n_mels + 1, dtype=int)
             bands = []
             for idx in range(n_mels):
                 lo, hi = band_edges[idx], max(band_edges[idx + 1], band_edges[idx] + 1)
                 bands.append(10.0 * np.log10(np.mean(spectrum[lo:hi]) + 1e-10))
             rows.append(bands)
-        return np.array(rows, dtype=np.float32)
+        return np.array(rows, dtype=np.float32) if rows else np.zeros((1, n_mels), dtype=np.float32)
 
     def predict(self, audio: np.ndarray) -> float:
         """

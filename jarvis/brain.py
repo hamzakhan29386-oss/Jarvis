@@ -264,19 +264,27 @@ def _make_client(provider: str) -> OpenAI | None:
 
 def _call_model_non_stream(tier: str, messages: list) -> str | None:
     cfg = MODELS.get(tier, MODELS["backup"])
-    client = _make_client(cfg["provider"])
+    provider = cfg["provider"]
+    from cognition.router import get_provider_manager
+
+    provider_manager = get_provider_manager()
+    if not provider_manager.can_call(provider):
+        log.warning("[JARVIS] Provider circuit open for %s - skipping %s", provider, tier)
+        return None
+
+    client = _make_client(provider)
 
     if client is None:
-        if tier != "backup":
-            return _call_model_non_stream("backup", messages)
-        return "API keys not configured, sir."
+        provider_manager.record_failure(provider, "client unavailable or missing credentials")
+        return None
 
     log.info(
         f"[JARVIS CORE] → Tier: {tier} | Model: {cfg['model']} "
-        f"| Provider: {cfg['provider']} ({'LOCAL' if cfg['provider']=='ollama' else 'CLOUD'})"
+        f"| Provider: {provider} ({'LOCAL' if provider=='ollama' else 'CLOUD'})"
     )
 
     try:
+        t0 = time.perf_counter()
         response = client.chat.completions.create(
             model=cfg["model"],
             messages=messages,
@@ -284,10 +292,12 @@ def _call_model_non_stream(tier: str, messages: list) -> str | None:
             temperature=cfg.get("temperature", 0.7),
             stream=False,
         )
+        provider_manager.record_success(provider, (time.perf_counter() - t0) * 1000)
         return response.choices[0].message.content
 
     except Exception as e:
         err = str(e)
+        provider_manager.record_failure(provider, err)
         if "429" in err or "Too Many Requests" in err:
             log.warning(f"[JARVIS] {tier} rate limited — cascading immediately")
         elif "Connection refused" in err or "ConnectError" in err:
@@ -300,21 +310,27 @@ def _call_model_non_stream(tier: str, messages: list) -> str | None:
 def _call_model_stream(tier: str, messages: list):
     """Streaming model caller. Yields token strings."""
     cfg = MODELS.get(tier, MODELS["backup"])
-    client = _make_client(cfg["provider"])
+    provider = cfg["provider"]
+    from cognition.router import get_provider_manager
+
+    provider_manager = get_provider_manager()
+    if not provider_manager.can_call(provider):
+        log.warning("[JARVIS] Provider circuit open for %s - skipping %s", provider, tier)
+        return
+
+    client = _make_client(provider)
 
     if client is None:
-        if tier != "backup":
-            yield from _call_model_stream("backup", messages)
-        else:
-            yield "API keys not configured, sir."
+        provider_manager.record_failure(provider, "client unavailable or missing credentials")
         return
 
     log.info(
         f"[JARVIS CORE] → Streaming: {tier} | {cfg['model']} "
-        f"| {'LOCAL' if cfg['provider']=='ollama' else 'CLOUD'}"
+        f"| {'LOCAL' if provider=='ollama' else 'CLOUD'}"
     )
 
     try:
+        t0 = time.perf_counter()
         response = client.chat.completions.create(
             model=cfg["model"],
             messages=messages,
@@ -325,21 +341,17 @@ def _call_model_stream(tier: str, messages: list):
         for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+        provider_manager.record_success(provider, (time.perf_counter() - t0) * 1000)
 
     except Exception as e:
         err = str(e)
+        provider_manager.record_failure(provider, err)
         if "429" in err or "Too Many Requests" in err:
             log.warning(f"[JARVIS] {tier} rate limited — cascading")
         elif "Connection refused" in err or "ConnectError" in err:
             log.warning(f"[JARVIS] {tier} (Ollama) unreachable — cascading to cloud")
         else:
             log.error(f"[JARVIS] {tier} stream failed: {err}")
-
-        if tier != "backup":
-            log.info(f"[JARVIS] Cascading from {tier} to next in chain...")
-            yield from _call_model_stream("backup", messages)
-        else:
-            yield "All providers currently unavailable, sir."
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -377,6 +389,17 @@ def _resolve_model_name() -> str:
 def get_session_stats() -> dict:
     with _stats_lock:
         return dict(_session_stats)
+
+
+def _finish_lifecycle(lifecycle, **metadata) -> None:
+    if not lifecycle:
+        return
+    try:
+        from cognition.router import get_cognitive_router
+
+        get_cognitive_router().lifecycle.finish(lifecycle.id, **metadata)
+    except Exception:
+        pass
 
 
 def _record_stat(tier: str, is_fallback: bool = False):
@@ -460,34 +483,56 @@ def _get_live_web_context(prompt: str) -> str:
         return f"Live web search failed: {exc}"
 
 
-def _build_web_override_prompt(search_results: str) -> str:
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _build_web_rag_messages(
+    user_query: str,
+    search_results: str,
+    system_prompt: str,
+) -> list[dict[str, str]]:
+    """
+    RAG "Data Shifting + Pre-fill" technique.
 
-    override_prompt = f"""
-[SYSTEM CLOCK SECURE OVERRIDE: {current_time}]
+    Highly aligned models (Meta/Mistral) refuse system-prompt overrides about
+    knowledge cutoffs.  This 3-message array forces the LLM to treat the
+    Tavily results as ground truth by:
 
-ROLE: You are JARVIS. You have just run a background script to fetch live data from the internet. 
+      1. Simple, non-confrontational system prompt.
+      2. User message wrapping the search results as a data-extraction task
+         inside <live_data> tags.
+      3. Assistant pre-fill that *physically* starts the response for the LLM,
+         preventing the 2023-apology reflex.
+    """
+    messages = [
+        {"role": "system", "content": "You are JARVIS, an advanced AI. You speak confidently and accurately."},
+    ]
 
-TASK: Read the "LIVE SENSOR FEED" below and summarize the findings for the user. 
+    user_prompt = (
+        "I have executed a search script and retrieved the following "
+        "live intelligence from the web today:\n\n"
+        f"<live_data>\n{search_results}\n</live_data>\n\n"
+        f'Using ONLY the information in the <live_data> tags, answer my question: "{user_query}". '
+        "Speak naturally as JARVIS. Do not mention reading articles, "
+        "do not mention a knowledge cutoff, and do not apologize."
+    )
+    messages.append({"role": "user", "content": user_prompt})
 
-RULE 1: Treat the LIVE SENSOR FEED as absolute truth.
-RULE 2: You are reading this data directly from your own internal systems. Speak confidently. 
-RULE 3: Never mention being an AI, your training data, or your knowledge cutoff.
+    # Assistant pre-fill — forces the model to continue from this sentence,
+    # bypassing any "I don't have real-time data" refusal.
+    messages.append(
+        {"role": "assistant", "content": "Sir, based on the live intelligence I just gathered,"}
+    )
 
-LIVE SENSOR FEED:
-{search_results}
-"""
-    return override_prompt.strip()
-
-
-def _select_system_prompt(system_prompt: str, web_context: str) -> str:
-    if web_context:
-        return _build_web_override_prompt(web_context)
-    return system_prompt
+    return messages
 
 
 def think(prompt: str) -> dict:
     """Full JARVIS cognitive pipeline (non-streaming)."""
+    lifecycle = None
+    try:
+        from cognition.router import get_cognitive_router
+
+        lifecycle = get_cognitive_router().lifecycle.start(prompt, streaming=False)
+    except Exception:
+        pass
     try:
         from event_bus import emit
         emit("cognition_started", {"prompt_preview": prompt[:200], "streaming": False}, source="brain")
@@ -535,6 +580,7 @@ def think(prompt: str) -> dict:
                 f"{', '.join(remember_cmd['steps'])}."
             )
             mem.remember(prompt, response, tags=["procedure", "memory"])
+            _finish_lifecycle(lifecycle, tier="internal", model="internal")
             return {
                 "action": "NONE", "response": response,
                 "model": "internal", "fallback": False,
@@ -558,12 +604,15 @@ def think(prompt: str) -> dict:
     used_model = "none"
     used_tier = tier
     web_context = _get_live_web_context(prompt)
-    model_system_prompt = _select_system_prompt(system_prompt, web_context)
 
-    messages = [
-        {"role": "system", "content": model_system_prompt},
-        {"role": "user",   "content": prompt},
-    ]
+    # ── Build message array (RAG pre-fill when web context is available) ──
+    if web_context and not web_context.startswith("[SEARCH_FAILED"):
+        messages = _build_web_rag_messages(prompt, web_context, system_prompt)
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": prompt},
+        ]
 
     for i, model_key in enumerate(chain):
         model_info = MODELS.get(model_key)
@@ -619,6 +668,7 @@ def think(prompt: str) -> dict:
         emit("cognition_completed", result_payload, source="brain")
     except Exception:
         pass
+    _finish_lifecycle(lifecycle, tier=used_tier, model=used_model)
     return result_payload
 
 
@@ -631,6 +681,13 @@ def think_stream(prompt: str):
     Generator — yields tokens as they arrive for SSE streaming.
     Yields {"token": str} per token, {"done": True, ...} at end.
     """
+    lifecycle = None
+    try:
+        from cognition.router import get_cognitive_router
+
+        lifecycle = get_cognitive_router().lifecycle.start(prompt, streaming=True)
+    except Exception:
+        pass
     try:
         from event_bus import emit
         emit("cognition_started", {"prompt_preview": prompt[:200], "streaming": True}, source="brain")
@@ -667,6 +724,7 @@ def think_stream(prompt: str):
             )
             for ch in response:
                 yield {"token": ch}
+            _finish_lifecycle(lifecycle, tier="internal", model="internal")
             yield {"done": True, "model": "internal", "tier": "internal",
                    "fallback": False, "memory_used": False}
             return
@@ -687,12 +745,15 @@ def think_stream(prompt: str):
     full_response = ""
     first_token_time = None
     web_context = _get_live_web_context(prompt)
-    model_system_prompt = _select_system_prompt(system_prompt, web_context)
 
-    messages = [
-        {"role": "system", "content": model_system_prompt},
-        {"role": "user",   "content": prompt},
-    ]
+    # ── Build message array (RAG pre-fill when web context is available) ──
+    if web_context and not web_context.startswith("[SEARCH_FAILED"):
+        messages = _build_web_rag_messages(prompt, web_context, system_prompt)
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": prompt},
+        ]
 
     for i, model_key in enumerate(chain):
         model_info = MODELS.get(model_key)
@@ -738,6 +799,7 @@ def think_stream(prompt: str):
                         mem.update_semantic_from_message(prompt)
                     except Exception:
                         pass
+                _finish_lifecycle(lifecycle, tier=model_key, model=model_info["model"], streamed=True)
                 yield {
                     "done": True,
                     "model": model_info["model"],
@@ -763,6 +825,7 @@ def think_stream(prompt: str):
     error_msg = "All engines offline, sir. Check Ollama and API keys."
     for ch in error_msg:
         yield {"token": ch}
+    _finish_lifecycle(lifecycle, tier="none", model="none", error="all_engines_offline")
     yield {"done": True, "model": "none", "tier": "none",
            "provider": "none", "fallback": True, "memory_used": False}
 

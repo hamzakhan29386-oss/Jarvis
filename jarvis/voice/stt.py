@@ -23,7 +23,7 @@ from wake.config import (
 )
 from wake.noise import NoisePipeline
 
-from .audio_input import AudioInputConfig, NativeAudioInput
+from .audio_multiplexer import get_audio_multiplexer
 from .resampler import AudioResampler, float32_to_int16
 
 log = logging.getLogger("jarvis.voice.stt")
@@ -73,17 +73,19 @@ class NativeSTT:
         if status_callback:
             status_callback("listening")
 
-        mic = NativeAudioInput(AudioInputConfig(queue_size=96))
+        audio = get_audio_multiplexer()
+        started_here = not audio.is_running()
+        audio.start()
+        subscription = audio.subscribe("stt", maxsize=96)
         frames: list[np.ndarray] = []
         speech_samples = 0
         silence_start: float | None = None
         start = time.monotonic()
 
         try:
-            mic.start()
-            log.info("[STT] Native mic capture started for command")
+            log.info("[STT] Native multiplexer capture started for command")
             while time.monotonic() - start < max_duration_s:
-                frame = mic.read(timeout=0.25)
+                frame = subscription.read(timeout=0.25)
                 if frame is None:
                     continue
                 audio16 = self._resampler.process(frame.data, frame.samplerate)
@@ -101,7 +103,9 @@ class NativeSTT:
                     elif time.monotonic() - silence_start >= silence_timeout_s and speech_samples > 0:
                         break
         finally:
-            mic.stop()
+            audio.unsubscribe(subscription)
+            if started_here:
+                audio.stop()
 
         if not frames:
             return ""

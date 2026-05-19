@@ -6,6 +6,9 @@ import importlib.util
 from pathlib import Path
 from types import ModuleType
 
+from .audio_multiplexer import AudioMultiplexer, get_audio_multiplexer
+from .streaming import StreamingSpeaker
+
 _LEGACY: ModuleType | None = None
 
 
@@ -42,8 +45,16 @@ def get_wake_service(*args, **kwargs):
 
 def __getattr__(name: str):
     if name == "StreamingSpeaker":
-        return getattr(_legacy(), name)
+        return StreamingSpeaker
     raise AttributeError(name)
 
 
-__all__ = ["get_voice_engine", "listen", "speak", "get_wake_service", "StreamingSpeaker"]
+__all__ = [
+    "get_voice_engine",
+    "listen",
+    "speak",
+    "get_wake_service",
+    "AudioMultiplexer",
+    "get_audio_multiplexer",
+    "StreamingSpeaker",
+]

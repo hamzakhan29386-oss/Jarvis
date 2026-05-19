@@ -34,6 +34,7 @@ let currentMode = "auto";
 let voiceActive = false;
 let audioCtx = null;
 let autonomousEnabled = false;
+let runtimeEventSource = null;
 let ttsEnabled = false;   // proactive TTS — muted by default, toggled via button
 
 // ── API URLs ───────────────────────────────────────────────────
@@ -41,6 +42,7 @@ const API = { ask:"/ask", stream:"/ask-stream", health:"/health",
   setMode:"/set-mode", getMode:"/get-mode", sysStatus:"/system-status",
   convHistory:"/conversation-history", parseIntent:"/intent/parse",
   command:"/assistant/command", cognitive:"/cognitive/status",
+  assistantState:"/assistant/state", eventStream:"/ws/events",
   autonomyStart:"/autonomous/start", autonomyStop:"/autonomous/stop" };
 
 // ═══════════════════════════════════════════════════════════════
@@ -75,6 +77,56 @@ function setState(state) {
   if (state === "processing") playTone(400, 0.05, 0.1);
 }
 
+function mapBackendState(state) {
+  return ({
+    idle: "idle",
+    listening: "listening",
+    thinking: "processing",
+    speaking: "streaming",
+    executing: "acting",
+    interrupted: "idle",
+    offline: "dormant",
+    recovering: "processing"
+  })[state] || "idle";
+}
+
+function applyAssistantState(snapshot) {
+  if (!snapshot || !snapshot.state) return;
+  setState(mapBackendState(snapshot.state));
+}
+
+function connectRuntimeEvents() {
+  if (runtimeEventSource) runtimeEventSource.close();
+  runtimeEventSource = new EventSource(API.eventStream);
+  runtimeEventSource.onmessage = event => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.name === "assistant_state_changed") applyAssistantState(data.payload);
+      if (data.name === "memory_updated") showMemoryIndicator();
+      if (data.name === "provider_call_failed") showToast("Provider cooling down", "error");
+      if (cogStream && data.name) {
+        const row = document.createElement("div");
+        row.className = "cognitive-event";
+        row.textContent = `${new Date((data.timestamp || Date.now()/1000) * 1000).toLocaleTimeString()} ${data.name}`;
+        cogStream.prepend(row);
+        while (cogStream.children.length > 5) cogStream.lastChild.remove();
+      }
+    } catch {}
+  };
+  runtimeEventSource.onerror = () => {
+    setTimeout(() => {
+      if (!runtimeEventSource || runtimeEventSource.readyState === EventSource.CLOSED) connectRuntimeEvents();
+    }, 3000);
+  };
+}
+
+async function syncAssistantState() {
+  try {
+    const r = await fetch(API.assistantState, {signal:AbortSignal.timeout(3000)});
+    if (r.ok) applyAssistantState(await r.json());
+  } catch {}
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════════════════════
@@ -84,11 +136,14 @@ document.addEventListener("DOMContentLoaded", () => {
   createTickMarks();
   checkHealth();
   fetchMode();
+  syncAssistantState();
+  connectRuntimeEvents();
   pollCognitiveStatus();
   pollSystemStatus();
   userInput.focus();
-  setTimeout(() => setState("idle"), 2000);
+  setTimeout(() => { if (currentState === "dormant") setState("idle"); }, 2000);
   setInterval(() => { if (!isProcessing) checkHealth(); }, 30000);  // skip health during generation
+  setInterval(() => { if (!isProcessing) syncAssistantState(); }, 10000);
   setInterval(() => { if (!isProcessing) pollSystemStatus(); }, 8000);  // slower polls, skip during gen
   setInterval(() => { if (!isProcessing) pollCognitiveStatus(); }, 5000);
 });

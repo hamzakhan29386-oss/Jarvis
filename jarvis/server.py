@@ -30,9 +30,12 @@ _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from flask import Flask, request, jsonify, send_from_directory, Response
 import traceback
 import json
+import queue
 import time
 import threading
 from core.paths import resource_path
+from core.assistant_state import get_assistant_state
+from core.metrics import get_metrics
 from brain import (
     think, think_stream, check_nvidia, check_openrouter, check_gemini,
     check_ollama, set_mode, get_mode, get_session_stats, CURRENT_MODE,
@@ -94,6 +97,25 @@ def _add_to_history(role: str, text: str, model: str = "", tier: str = ""):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+def _set_assistant_state(state: str, reason: str, **metadata):
+    try:
+        return get_assistant_state().set_state(
+            state,
+            reason=reason,
+            source="server",
+            metadata=metadata,
+        )
+    except Exception:
+        return None
+
+
+def _metric(name: str, amount: int = 1):
+    try:
+        get_metrics().increment(name, amount)
+    except Exception:
+        pass
+
+
 #  ORIGINAL ENDPOINTS (preserved exactly)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -155,6 +177,7 @@ def health():
         "memory": mem_stats,
         "voice": voice_status,
         "session_stats": get_session_stats(),
+        "assistant_state": get_assistant_state().get_state(),
         "cognitive": cognitive_status,
     })
 
@@ -171,6 +194,8 @@ def ask():
         return jsonify({"error": "Empty message"}), 400
 
     try:
+        _metric("requests.ask")
+        _set_assistant_state("thinking", "ask", message_preview=user_message[:120])
         if emit:
             emit("user_prompt_received", {"message": user_message[:500]}, source="server")
         _add_to_history("user", user_message)
@@ -180,9 +205,12 @@ def ask():
             model=result.get("model", ""),
             tier=result.get("tier", ""),
         )
+        _set_assistant_state("idle", "ask_complete", model=result.get("model", ""))
         return jsonify(result)
 
     except Exception as e:
+        _metric("requests.ask.errors")
+        _set_assistant_state("recovering", "ask_error", error=str(e))
         traceback.print_exc()
         return jsonify({
             "action": "NONE",
@@ -206,6 +234,8 @@ def ask_stream():
     if not user_message:
         return jsonify({"error": "Empty message"}), 400
 
+    _metric("requests.ask_stream")
+    _set_assistant_state("thinking", "ask_stream", message_preview=user_message[:120])
     _add_to_history("user", user_message)
     try:
         if emit:
@@ -235,8 +265,11 @@ def ask_stream():
                         "fallback": chunk.get("fallback", False),
                         "memory_used": chunk.get("memory_used", False),
                     })
+                    _set_assistant_state("idle", "ask_stream_complete", model=chunk.get("model", ""))
                     yield f"data: {done_payload}\n\n"
         except Exception as e:
+            _metric("requests.ask_stream.errors")
+            _set_assistant_state("recovering", "ask_stream_error", error=str(e))
             traceback.print_exc()
             error_payload = json.dumps({
                 "done": True, "error": str(e),
@@ -295,11 +328,12 @@ def execute_action_endpoint():
         return jsonify({"error": "Missing 'action' field"}), 400
 
     try:
-        from actions import execute_action
+        from agents.closed_loop import get_closed_loop_executor
+
         action_name = data["action"]
         args = data.get("args", {})
-        result = execute_action(action_name, args)
-        return jsonify({"result": result, "action": action_name})
+        result = get_closed_loop_executor().run_action(action_name, args)
+        return jsonify({"result": result.get("result"), "action": action_name, "execution": result})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -418,6 +452,31 @@ def memory_procedure():
             triggers=data.get("triggers", [data["name"].replace("_", " ")]),
         )
         return jsonify({"success": True, "procedure": data["name"]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/memory/consolidate", methods=["POST"])
+def memory_consolidate_endpoint():
+    try:
+        from memory import get_memory
+
+        data = request.get_json(silent=True) or {}
+        return jsonify(get_memory().consolidate(limit=int(data.get("limit", 50))))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/memory/prune", methods=["POST"])
+def memory_prune_endpoint():
+    try:
+        from memory import get_memory
+
+        data = request.get_json(silent=True) or {}
+        return jsonify(get_memory().prune_memories(
+            retention_days=int(data.get("retention_days", 365)),
+            min_importance=float(data.get("min_importance", 0.2)),
+        ))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -661,247 +720,361 @@ def execution_replay_endpoint():
     return jsonify(get_execution_replay().recent(int(request.args.get("limit", 50))))
 
 
-REALTIME_ASK_ENDPOINT = '''
+@app.route("/assistant/state")
+def assistant_state_endpoint():
+    return jsonify(get_assistant_state().get_state())
+
+
+@app.route("/metrics")
+def metrics_endpoint():
+    payload = get_metrics().snapshot()
+    payload["assistant_state"] = get_assistant_state().get_state()
+    payload["session_stats"] = get_session_stats()
+    return jsonify(payload)
+
+
+@app.route("/cognition/router")
+def cognition_router_endpoint():
+    from cognition.router import get_cognitive_router
+
+    return jsonify(get_cognitive_router().snapshot())
+
+
+@app.route("/voice/interrupt", methods=["POST"])
+def voice_interrupt_endpoint():
+    errors = []
+    try:
+        from voice import get_voice_engine
+
+        engine = get_voice_engine()
+        if hasattr(engine, "stop_speaking"):
+            engine.stop_speaking()
+        elif hasattr(engine, "stop"):
+            engine.stop()
+    except Exception as e:
+        errors.append(str(e))
+
+    _metric("voice.interrupt")
+    state = _set_assistant_state("interrupted", "voice_interrupt", errors=errors)
+    return jsonify({"ok": not errors, "errors": errors, "state": state})
+
+
 @app.route("/voice/realtime-ask", methods=["POST"])
 def voice_realtime_ask():
-    """
-    Real-time voice pipeline endpoint.
- 
-    Streams tokens to the frontend via SSE AND simultaneously pipes them
-    into a StreamingSpeaker so JARVIS starts speaking the first sentence
-    before the AI has even finished generating.
- 
-    Request body (JSON):
-        message  — the user's query (required)
-        tts      — true to enable server-side TTS (default: true)
- 
-    SSE events (same format as /ask-stream):
-        data: {"char": "..."}          — each token
-        data: {"sentence": "..."}      — each sentence spoken (for UI feedback)
-        data: {"done": true, ...}      — stream complete
-    """
     data = request.get_json(silent=True)
     if not data or "message" not in data:
         return jsonify({"error": "Missing 'message' field"}), 400
- 
+
     user_message = data["message"].strip()
     if not user_message:
         return jsonify({"error": "Empty message"}), 400
- 
+
     tts_enabled = data.get("tts", True)
- 
+    if isinstance(tts_enabled, str):
+        tts_enabled = tts_enabled.strip().lower() not in {"0", "false", "no", "off"}
+
+    _metric("voice.realtime_ask")
+    _set_assistant_state("thinking", "voice_realtime_ask", message_preview=user_message[:120])
     _add_to_history("user", user_message)
- 
+
+    def _mark_idle_when_speech_finishes(speaker):
+        try:
+            speaker.wait_done(timeout=90.0)
+        finally:
+            _set_assistant_state("idle", "voice_realtime_complete")
+
     def generate():
         full_response = ""
-        speaker       = None
- 
+        speaker = None
+
         if tts_enabled:
             try:
-                from voice import get_voice_engine, StreamingSpeaker
-                engine  = get_voice_engine()
-                speaker = StreamingSpeaker(engine._tts)
+                from voice import StreamingSpeaker, get_voice_engine
+
+                engine = get_voice_engine()
+
+                def _on_sentence(sentence: str):
+                    _metric("voice.sentences_spoken")
+                    _set_assistant_state("speaking", "tts_sentence", sentence_preview=sentence[:120])
+
+                speaker = StreamingSpeaker(
+                    getattr(engine, "_tts", engine),
+                    on_sentence=_on_sentence,
+                )
             except Exception as e:
-                log.warning(f"[realtime-ask] TTS unavailable: {e}")
- 
-        def _on_sentence(sentence: str):
-            """Called by speaker just before each utterance — notify frontend."""
-            pass   # could yield a sentence event here; see below
- 
+                _metric("voice.tts_unavailable")
+                app.logger.warning("[realtime-ask] TTS unavailable: %s", e)
+
         try:
             for chunk in think_stream(user_message):
                 if "token" in chunk:
                     token = chunk["token"]
                     full_response += token
- 
-                    # ── 1. Send token to frontend ────────────────────────
-                    yield f"data: {json.dumps({'char': token})}\n\n"
- 
-                    # ── 2. Feed token to StreamingSpeaker ────────────────
                     if speaker is not None:
                         speaker.feed_token(token)
- 
-                elif "done" in chunk and chunk["done"]:
-                    # Flush any trailing text to TTS
+                    yield f"data: {json.dumps({'char': token})}\n\n"
+
+                elif chunk.get("done"):
                     if speaker is not None:
                         speaker.flush()
-                        # Don't wait_done() here — let audio finish in background
-                        # so the SSE response returns promptly.
- 
+                        threading.Thread(
+                            target=_mark_idle_when_speech_finishes,
+                            args=(speaker,),
+                            daemon=True,
+                            name="JARVISRealtimeTTSIdleMarker",
+                        ).start()
+                    else:
+                        _set_assistant_state("idle", "voice_realtime_complete")
+
                     _add_to_history(
-                        "jarvis", full_response,
+                        "jarvis",
+                        full_response,
                         model=chunk.get("model", ""),
                         tier=chunk.get("tier", ""),
                     )
                     done_payload = json.dumps({
-                        "done":        True,
-                        "action":      "NONE",
-                        "model":       chunk.get("model",    "unknown"),
-                        "tier":        chunk.get("tier",     "unknown"),
-                        "provider":    chunk.get("provider", "unknown"),
-                        "fallback":    chunk.get("fallback",    False),
+                        "done": True,
+                        "action": "NONE",
+                        "model": chunk.get("model", "unknown"),
+                        "tier": chunk.get("tier", "unknown"),
+                        "provider": chunk.get("provider", "unknown"),
+                        "fallback": chunk.get("fallback", False),
                         "memory_used": chunk.get("memory_used", False),
-                        "tts_active":  speaker is not None,
+                        "tts_active": speaker is not None,
                     })
                     yield f"data: {done_payload}\n\n"
- 
         except Exception as e:
+            _metric("voice.realtime_ask.errors")
+            _set_assistant_state("recovering", "voice_realtime_error", error=str(e))
             traceback.print_exc()
-            if speaker:
+            if speaker is not None:
                 try:
                     speaker.stop()
                 except Exception:
                     pass
-            yield f"data: {json.dumps({'done': True, 'error': str(e), 'action': 'NONE', 'model': 'none', 'fallback': True})}\n\n"
- 
+            error_payload = json.dumps({
+                "done": True,
+                "error": str(e),
+                "action": "NONE",
+                "model": "none",
+                "fallback": True,
+            })
+            yield f"data: {error_payload}\n\n"
+
     return Response(
         generate(),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control":    "no-cache",
+            "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Connection":       "keep-alive",
+            "Connection": "keep-alive",
         },
     )
- 
- 
-@app.route("/cognitive/status")
-def cognitive_status_endpoint():
-    try:
-        return jsonify({
-            "world": get_world_state().get_state(),
-            "attention": get_attention_manager().status(),
-            "agent_loop": get_agent_loop().status(),
-            "operating_mode": get_operating_mode(),
-            "events": get_event_bus().history(50),
-            "goals": get_goal_planner().list_goals(),
-            "optimizer": get_self_optimizer().recommend_tools(),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/world-state", methods=["GET", "POST"])
-def world_state_endpoint():
-    try:
-        ws = get_world_state()
-        if request.method == "POST":
-            data = request.get_json(silent=True) or {}
-            return jsonify(ws.update_state(data.get("updates", data), source="api"))
-        return jsonify(ws.get_state())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/goals", methods=["GET", "POST", "DELETE"])
-def goals_endpoint():
-    try:
-        planner = get_goal_planner()
-        if request.method == "POST":
-            data = request.get_json(silent=True) or {}
-            goal = planner.create_goal(
-                data.get("title", "Untitled mission"),
-                data.get("subtasks", []),
-                int(data.get("priority", 5)),
-            )
-            get_world_state().set_goal({"id": goal.id, "title": goal.title, "priority": goal.priority})
-            return jsonify(planner.goal_to_dict(goal))
-        if request.method == "DELETE":
-            goal_id = (request.get_json(silent=True) or {}).get("id", "")
-            return jsonify({"cleared": get_world_state().clear_goal(goal_id)})
-        return jsonify(planner.list_goals())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/operating-mode", methods=["GET", "POST"])
-def operating_mode_endpoint():
-    try:
-        if request.method == "POST":
-            data = request.get_json(silent=True) or {}
-            return jsonify(set_operating_mode(data.get("mode", "ASSIST")))
-        return jsonify(get_operating_mode())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/autonomous/start", methods=["POST"])
-def autonomous_start():
-    return jsonify(get_agent_loop().start())
-
-
-@app.route("/autonomous/pause", methods=["POST"])
-def autonomous_pause():
-    return jsonify(get_agent_loop().pause())
-
-
-@app.route("/autonomous/resume", methods=["POST"])
-def autonomous_resume():
-    return jsonify(get_agent_loop().resume())
-
-
-@app.route("/autonomous/stop", methods=["POST"])
-def autonomous_stop():
-    return jsonify(get_agent_loop().stop())
-
-
-@app.route("/autonomous/enqueue", methods=["POST"])
-def autonomous_enqueue():
-    data = request.get_json(silent=True) or {}
-    job = AgentJob(kind=data.get("kind", "tool"), payload=data.get("payload", {}), priority=int(data.get("priority", 5)))
-    get_agent_loop().enqueue(job)
-    return jsonify({"queued": True, "job": job.__dict__})
-
-
-@app.route("/tools")
-def tools_endpoint():
-    return jsonify(get_tool_registry().list_tools())
-
-
-@app.route("/skills")
-def skills_endpoint():
-    return jsonify(get_skill_manager().list_skills())
-
-
-@app.route("/events")
-def events_endpoint():
-    return jsonify(get_event_bus().history(int(request.args.get("limit", 100))))
-
-
-@app.route("/execution-replay")
-def execution_replay_endpoint():
-    return jsonify(get_execution_replay().recent(int(request.args.get("limit", 50))))
 
 
 @app.route("/voice/tts-engine", methods=["POST", "GET"])
 def voice_tts_engine():
-    """
-    GET  → return current TTS engine name
-    POST → switch TTS engine at runtime
-           Body: {"engine": "pyttsx3" | "piper" | "coqui"}
-    """
     try:
         from voice import get_voice_engine
+
         engine = get_voice_engine()
- 
         if request.method == "GET":
             status = engine.get_status()
             return jsonify({
-                "tts_engine":      status["tts_engine"],
-                "piper_available": status.get("piper_available", False),
+                "tts_engine": status.get("tts_engine", "unknown"),
+                "is_speaking": status.get("is_speaking", False),
             })
- 
+
         data = request.get_json(silent=True) or {}
         new_engine = data.get("engine", "pyttsx3")
         if new_engine not in ("pyttsx3", "piper", "coqui"):
             return jsonify({"error": f"Unknown engine: {new_engine}"}), 400
- 
+
         engine.switch_tts(new_engine)
+        _metric("voice.tts_engine.switch")
         return jsonify({"success": True, "engine": new_engine})
- 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-'''
+
+
+@app.route("/ws/events")
+def ws_events_endpoint():
+    """SSE-compatible realtime event stream at the planned WebSocket path."""
+    bus = get_event_bus()
+    event_queue: queue.Queue = queue.Queue(maxsize=256)
+
+    def _push(event):
+        try:
+            event_queue.put_nowait(event.to_dict())
+        except queue.Full:
+            try:
+                event_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                event_queue.put_nowait(event.to_dict())
+            except queue.Full:
+                pass
+
+    token = bus.subscribe("*", _push)
+
+    def generate():
+        yield f"data: {json.dumps({'event': 'connected', 'transport': 'sse', 'path': '/ws/events'})}\n\n"
+        try:
+            while True:
+                try:
+                    event = event_queue.get(timeout=20.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except queue.Empty:
+                    yield f"data: {json.dumps({'event': 'heartbeat', 'ts': time.time()})}\n\n"
+        finally:
+            bus.unsubscribe(token)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.route("/context/status")
+def context_status_endpoint():
+    from core.contextual_cowork import get_contextual_cowork_service
+
+    return jsonify(get_contextual_cowork_service().status())
+
+
+@app.route("/context/screen", methods=["GET", "POST"])
+def context_screen_endpoint():
+    from core.contextual_cowork import get_contextual_cowork_service
+
+    data = request.get_json(silent=True) or {}
+    save = str(data.get("save", request.args.get("save", "false"))).lower() in {"1", "true", "yes", "on"}
+    return jsonify(get_contextual_cowork_service().capture_screen(save=save))
+
+
+@app.route("/context/explain", methods=["POST"])
+def context_explain_endpoint():
+    from core.contextual_cowork import get_contextual_cowork_service
+
+    data = request.get_json(silent=True) or {}
+    include_ocr = bool(data.get("ocr", False))
+    save = bool(data.get("save_screenshot", False))
+    return jsonify(get_contextual_cowork_service().extract_context(include_ocr=include_ocr, save_screenshot=save))
+
+
+@app.route("/world/state", methods=["GET", "POST"])
+def world_state_alias_endpoint():
+    ws = get_world_state()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        return jsonify(ws.update_state(data.get("updates", data), source="api"))
+    return jsonify(ws.get_state())
+
+
+@app.route("/world/refresh", methods=["POST"])
+def world_refresh_endpoint():
+    return jsonify(get_world_state().refresh_environment())
+
+
+@app.route("/world/resume")
+def world_resume_endpoint():
+    ws = get_world_state()
+    state = ws.get_state()
+    return jsonify({
+        "active_goals": state.get("active_goals", []),
+        "current_task": state.get("current_task"),
+        "active_coding_project": state.get("active_coding_project"),
+        "current_workspace": state.get("current_workspace"),
+        "recent_actions": state.get("recent_actions", [])[-10:],
+        "ongoing_workflows": state.get("ongoing_workflows", []),
+        "operating_context": ws.operating_context(),
+    })
+
+
+@app.route("/optimization/status")
+def optimization_status_endpoint():
+    return jsonify(get_self_optimizer().status())
+
+
+@app.route("/optimization/recommendations")
+def optimization_recommendations_endpoint():
+    return jsonify(get_self_optimizer().recommend_tools())
+
+
+@app.route("/presence/status")
+def presence_status_endpoint():
+    from core.presence import get_presence_manager
+
+    return jsonify(get_presence_manager().status())
+
+
+@app.route("/presence/profile", methods=["POST"])
+def presence_profile_endpoint():
+    from core.presence import get_presence_manager
+
+    data = request.get_json(silent=True) or {}
+    return jsonify(get_presence_manager().set_profile(
+        mode=data.get("mode"),
+        voice_profile=data.get("voice_profile"),
+    ))
+
+
+@app.route("/presence/ack", methods=["POST"])
+def presence_ack_endpoint():
+    from core.presence import get_presence_manager
+
+    data = request.get_json(silent=True) or {}
+    return jsonify(get_presence_manager().acknowledge(
+        state=data.get("state", get_assistant_state().get_state().get("state", "idle")),
+        force=bool(data.get("force", False)),
+    ))
+
+
+@app.route("/runtime/tasks", methods=["GET", "POST"])
+def runtime_tasks_endpoint():
+    from core.long_task_runtime import get_long_task_runtime
+
+    runtime = get_long_task_runtime()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        objective = (data.get("objective") or "").strip()
+        if not objective:
+            return jsonify({"error": "Missing 'objective' field"}), 400
+        return jsonify(runtime.create_task(
+            objective,
+            constraints=data.get("constraints") or [],
+            plan=data.get("plan") or None,
+            requires_confirmation=bool(data.get("requires_confirmation", True)),
+        ))
+    return jsonify({"tasks": runtime.list_tasks()})
+
+
+@app.route("/runtime/tasks/<task_id>/pause", methods=["POST"])
+def runtime_task_pause_endpoint(task_id):
+    from core.long_task_runtime import get_long_task_runtime
+
+    return jsonify(get_long_task_runtime().update_status(task_id, "paused"))
+
+
+@app.route("/runtime/tasks/<task_id>/resume", methods=["POST"])
+def runtime_task_resume_endpoint(task_id):
+    from core.long_task_runtime import get_long_task_runtime
+
+    return jsonify(get_long_task_runtime().update_status(task_id, "active"))
+
+
+@app.route("/runtime/tasks/<task_id>/cancel", methods=["POST"])
+def runtime_task_cancel_endpoint(task_id):
+    from core.long_task_runtime import get_long_task_runtime
+
+    return jsonify(get_long_task_runtime().update_status(task_id, "cancelled"))
+
+
 if __name__ == "__main__":
     mode_info = get_mode()
 

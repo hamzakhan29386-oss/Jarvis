@@ -20,12 +20,6 @@ Speaker enrollment:
     python -m wake.enroll
 """
 
-from .service import ProductionWakeService, get_wake_service
-from .detector import WakeWordEngine
-from .speaker import SpeakerVerifier
-from .transcriber import PostWakeTranscriber
-from .noise import NoisePipeline
-
 __all__ = [
     "ProductionWakeService",
     "get_wake_service",
@@ -34,3 +28,24 @@ __all__ = [
     "PostWakeTranscriber",
     "NoisePipeline",
 ]
+
+
+_EXPORTS = {
+    "ProductionWakeService": (".service", "ProductionWakeService"),
+    "get_wake_service": (".service", "get_wake_service"),
+    "WakeWordEngine": (".detector", "WakeWordEngine"),
+    "SpeakerVerifier": (".speaker", "SpeakerVerifier"),
+    "PostWakeTranscriber": (".transcriber", "PostWakeTranscriber"),
+    "NoisePipeline": (".noise", "NoisePipeline"),
+}
+
+
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    from importlib import import_module
+
+    module_name, attr_name = _EXPORTS[name]
+    value = getattr(import_module(module_name, __name__), attr_name)
+    globals()[name] = value
+    return value

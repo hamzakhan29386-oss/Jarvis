@@ -44,18 +44,20 @@ class TaskRouter:
         return self._execute_intent(intent, speak=speak)
 
     def _execute_intent(self, intent: ParsedIntent, speak: bool = False) -> AssistantResult:
-        from actions import execute_action
+        from agents.closed_loop import get_closed_loop_executor
 
-        result = execute_action(intent.action, intent.args)
+        execution = get_closed_loop_executor().run_action(intent.action, intent.args)
+        result = execution.get("result", "")
         response = self._friendly_action_response(intent, result)
         if speak:
             self._speak_async(response)
         return AssistantResult(
-            ok=not self._looks_failed(result),
+            ok=bool(execution.get("ok")),
             intent=intent.to_dict(),
             response=response,
             action_result=result,
             tier="action",
+            metadata={"execution": execution},
         )
 
     def _ask_brain(self, text: str, intent: ParsedIntent, speak: bool = False) -> AssistantResult:

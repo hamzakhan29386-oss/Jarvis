@@ -115,14 +115,14 @@ class VoiceManager:
         self._publish(_evt("listening"))
         listener = self._listener
         if listener:
-            listener.audio.stop()
+            listener.pause()
         try:
             text = self._stt.capture_and_transcribe(status_callback=lambda e: self._publish(_evt(e)))
         finally:
             self._in_command_capture = False
             if self._enabled and listener:
                 try:
-                    listener.audio.start()
+                    listener.resume()
                 except Exception as exc:
                     self._handle_error(exc)
 

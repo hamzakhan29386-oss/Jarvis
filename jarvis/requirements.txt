@@ -56,7 +56,13 @@ chromadb                # local persistent vector database for Phase 1 memory
 # ── Coqui TTS (optional — larger natural voice, ~1.5GB) ─────────────────────
 # TTS                   # uncomment if you want Coqui as TTS option
 
+# ── Voice: Wake Word Audio Processing ────────────────────────────────────────
+webrtcvad               # WebRTC VAD gate — drops non-speech before wake word inference
+librosa                 # MFCC / mel spectrogram extraction (train + inference parity)
+
+# ── Agentic Web Search ──────────────────────────────────────────────────────
+tavily-python           # Tavily deep search (replaces rate-limited duckduckgo-search)
+
 # ── Utilities ────────────────────────────────────────────────────────────────
 python-dotenv
 pyinstaller
-duckduckgo-search==6.3.7  # AsyncDDGS-powered live web search
